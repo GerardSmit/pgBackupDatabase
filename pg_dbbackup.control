@@ -1,0 +1,6 @@
+comment = 'Per-database backup and restore with PITR support'
+default_version = '1.0.0'
+module_pathname = '$libdir/pg_dbbackup'
+schema = 'dbbackup'
+relocatable = false
+superuser = true
