@@ -19,6 +19,7 @@
 #include "restore_simple.h"
 #include "restore_full.h"
 #include "inspect.h"
+#include "logical_journal.h"
 #include "metadata_gen.h"
 #include "ddl_gen.h"
 
@@ -40,7 +41,7 @@ PG_FUNCTION_INFO_V1(pg_dbbackup_test_ddl);
 void
 _PG_init(void)
 {
-	/* nothing to initialize yet — no shared_preload_libraries needed */
+	pgdb_logical_journal_init(process_shared_preload_libraries_in_progress);
 }
 
 /*

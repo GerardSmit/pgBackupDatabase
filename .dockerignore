@@ -1,0 +1,7 @@
+.git
+.claude
+tests
+**/bin
+**/obj
+*.bak
+test_run*.log

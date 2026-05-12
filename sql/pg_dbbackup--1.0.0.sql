@@ -8,6 +8,245 @@ CREATE TABLE dbbackup.db_config (
         CHECK (mode IN ('simple', 'full'))
 );
 
+-- FULL-mode logical PITR chain metadata. DML is not persisted here; it is
+-- decoded from PostgreSQL WAL through the chain's logical replication slot
+-- and written directly to LOG .bak files. Chain slots are created with
+-- failover=true so PostgreSQL 17+ slot synchronization can carry them to
+-- standbys for primary promotion.
+CREATE TABLE dbbackup.logical_chains (
+    db_oid        oid PRIMARY KEY,
+    db_name       text NOT NULL,
+    slot_name     name NOT NULL UNIQUE,
+    confirmed_lsn pg_lsn NOT NULL,
+    updated_at    timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+-- Inspect whether a FULL-mode chain slot is safe to use after standby
+-- promotion. On the primary, failover=true is the expected chain-slot state.
+-- On a standby, PostgreSQL must also report synced=true, temporary=false, and
+-- no invalidation reason before the slot survives promotion.
+CREATE FUNCTION dbbackup.pg_dbbackup_failover_slot_status(dbname text)
+RETURNS TABLE (
+    slot_name           name,
+    slot_exists         boolean,
+    database_name       text,
+    slot_type           text,
+    plugin              name,
+    failover            boolean,
+    synced              boolean,
+    temporary           boolean,
+    invalidation_reason text,
+    restart_lsn         pg_lsn,
+    confirmed_flush_lsn pg_lsn,
+    catalog_xmin        xid,
+    wal_status          text,
+    standby_ready       boolean
+)
+LANGUAGE sql
+STABLE
+STRICT
+AS $$
+    SELECT
+        ('_pg_dbbackup_' || d.oid::text)::name AS slot_name,
+        s.slot_name IS NOT NULL AS slot_exists,
+        d.datname AS database_name,
+        s.slot_type,
+        s.plugin,
+        COALESCE(s.failover, false) AS failover,
+        COALESCE(s.synced, false) AS synced,
+        COALESCE(s.temporary, false) AS temporary,
+        s.invalidation_reason,
+        s.restart_lsn,
+        s.confirmed_flush_lsn,
+        s.catalog_xmin,
+        s.wal_status,
+        COALESCE(
+            s.slot_type = 'logical'
+            AND s.plugin = 'pg_dbbackup'
+            AND s.failover
+            AND s.synced
+            AND NOT s.temporary
+            AND s.invalidation_reason IS NULL,
+            false) AS standby_ready
+    FROM pg_database d
+    LEFT JOIN pg_replication_slots s
+      ON s.slot_name = ('_pg_dbbackup_' || d.oid::text)::name
+    WHERE d.datname = $1
+$$;
+
+CREATE FUNCTION dbbackup.pg_dbbackup_failover_slot_ready(dbname text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+STRICT
+AS $$
+    SELECT COALESCE((
+        SELECT standby_ready
+        FROM dbbackup.pg_dbbackup_failover_slot_status($1)
+    ), false)
+$$;
+
+CREATE FUNCTION dbbackup.pg_dbbackup_wait_failover_slot_ready(
+    dbname       text,
+    timeout_secs int DEFAULT 60
+) RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+STRICT
+AS $$
+DECLARE
+    deadline timestamptz;
+BEGIN
+    IF timeout_secs < 0 THEN
+        RAISE EXCEPTION 'timeout_secs must be >= 0';
+    END IF;
+
+    deadline := clock_timestamp() + make_interval(secs => timeout_secs);
+
+    LOOP
+        IF dbbackup.pg_dbbackup_failover_slot_ready(dbname) THEN
+            RETURN true;
+        END IF;
+
+        IF clock_timestamp() >= deadline THEN
+            RETURN false;
+        END IF;
+
+        PERFORM pg_sleep(0.2);
+    END LOOP;
+END
+$$;
+
+-- Database-local DDL journal. Logical decoding does not emit DDL by itself,
+-- so FULL-mode LOG backups decode this table specially and replay the captured
+-- command text in transaction order with row changes.
+CREATE TABLE dbbackup.ddl_log (
+    id          bigserial PRIMARY KEY,
+    txid        bigint NOT NULL DEFAULT txid_current(),
+    lsn         pg_lsn NOT NULL DEFAULT pg_current_wal_lsn(),
+    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    tag         text NOT NULL,
+    command     text NOT NULL
+);
+
+-- Transaction-end state journals for objects PostgreSQL logical decoding does
+-- not expose as ordinary user-table DML. The output plugin decodes these
+-- tables specially and emits replay SQL instead of restoring the journal rows.
+CREATE TABLE dbbackup.sequence_state_cache (
+    schema_name   text NOT NULL,
+    sequence_name text NOT NULL,
+    last_value    numeric NOT NULL,
+    is_called     boolean NOT NULL,
+    PRIMARY KEY (schema_name, sequence_name)
+);
+
+CREATE TABLE dbbackup.sequence_log (
+    id            bigserial PRIMARY KEY,
+    txid          bigint NOT NULL DEFAULT txid_current(),
+    recorded_at   timestamptz NOT NULL DEFAULT clock_timestamp(),
+    schema_name   text NOT NULL,
+    sequence_name text NOT NULL,
+    last_value    numeric NOT NULL,
+    is_called     boolean NOT NULL
+);
+
+CREATE TABLE dbbackup.large_object_state_cache (
+    loid        oid PRIMARY KEY,
+    object_hash text NOT NULL
+);
+
+CREATE TABLE dbbackup.large_object_log (
+    id           bigserial PRIMARY KEY,
+    txid         bigint NOT NULL DEFAULT txid_current(),
+    recorded_at  timestamptz NOT NULL DEFAULT clock_timestamp(),
+    loid         oid NOT NULL,
+    action       text NOT NULL CHECK (action IN ('snapshot', 'unlink')),
+    snapshot_sql text NOT NULL
+);
+
+CREATE FUNCTION dbbackup.pg_dbbackup_capture_ddl_command_end()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    q text := current_query();
+    obj record;
+BEGIN
+    IF current_setting('dbbackup.replaying', true) = 'on' THEN
+        RETURN;
+    END IF;
+
+    IF q IS NULL OR btrim(q) = '' THEN
+        RETURN;
+    END IF;
+
+    SELECT * INTO obj
+      FROM pg_event_trigger_ddl_commands()
+     LIMIT 1;
+
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    IF obj.schema_name LIKE 'pg\_%'
+       OR obj.schema_name IN (
+            'dbbackup',
+            'information_schema',
+            '_timescaledb_internal',
+            '_timescaledb_catalog',
+            '_timescaledb_config',
+            '_timescaledb_cache',
+            '_timescaledb_functions',
+            'timescaledb_information',
+            'timescaledb_experimental') THEN
+        RETURN;
+    END IF;
+
+    IF obj.in_extension AND tg_tag <> 'CREATE EXTENSION' THEN
+        RETURN;
+    END IF;
+
+    IF q ~* '^\s*(CREATE|ALTER|DROP)\s+EXTENSION\s+pg_dbbackup\b' THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO dbbackup.ddl_log(tag, command)
+    VALUES (tg_tag, q);
+END
+$$;
+
+CREATE FUNCTION dbbackup.pg_dbbackup_capture_sql_drop()
+RETURNS event_trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    q text := current_query();
+BEGIN
+    IF current_setting('dbbackup.replaying', true) = 'on' THEN
+        RETURN;
+    END IF;
+
+    IF q IS NULL OR btrim(q) = '' THEN
+        RETURN;
+    END IF;
+
+    IF q ~* '^\s*DROP\s+EXTENSION\s+pg_dbbackup\b' THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO dbbackup.ddl_log(tag, command)
+    VALUES (tg_tag, q);
+END
+$$;
+
+CREATE EVENT TRIGGER pg_dbbackup_ddl_command_end
+    ON ddl_command_end
+    EXECUTE FUNCTION dbbackup.pg_dbbackup_capture_ddl_command_end();
+
+CREATE EVENT TRIGGER pg_dbbackup_sql_drop
+    ON sql_drop
+    EXECUTE FUNCTION dbbackup.pg_dbbackup_capture_sql_drop();
+
 -- Set recovery mode for a database
 CREATE FUNCTION dbbackup.pg_dbbackup_set_mode(
     dbname text,

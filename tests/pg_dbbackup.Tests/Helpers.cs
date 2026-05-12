@@ -15,7 +15,7 @@ internal static class Helpers
     public const byte SectionMetadata = 0x01;
     public const byte SectionSchema = 0x02;
     public const byte SectionData = 0x03;
-    public const byte SectionWal = 0x04;
+    public const byte SectionLogicalStream = 0x04;
     public const byte SectionWalSegments = 0x05;
 
     public static string BackupPath(string prefix = "pgdbbackup") =>
@@ -89,6 +89,26 @@ internal static class Helpers
         foreach (var s in WalkSections(file))
             types.Add(s.sectionType);
         return types;
+    }
+
+    public static List<string> DecodeLogicalStream(byte[] data)
+    {
+        var frames = new List<string>();
+        if (data.Length < 4) return frames;
+
+        var count = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(0, 4));
+        var offset = 4;
+        for (uint i = 0; i < count && offset + 4 <= data.Length; i++)
+        {
+            var len = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(offset, 4));
+            offset += 4;
+            var iLen = checked((int)len);
+            if (offset + iLen > data.Length) break;
+            frames.Add(Encoding.UTF8.GetString(data, offset, iLen));
+            offset += iLen;
+        }
+
+        return frames;
     }
 
     /// <summary>

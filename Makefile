@@ -12,9 +12,8 @@ OBJS = \
 	src/backup_async.o \
 	src/restore_simple.o \
 	src/restore_full.o \
-	src/wal_filter.o \
-	src/wal_replay.o \
-	src/subprocess_recovery.o \
+	src/logical_plugin.o \
+	src/logical_journal.o \
 	src/ddl_gen.o \
 	src/metadata_gen.o \
 	src/inspect.o \

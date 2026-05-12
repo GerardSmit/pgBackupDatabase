@@ -60,7 +60,7 @@ public sealed class FullDifferentialTests
     }
 
     [Fact]
-    public async Task FullDiff_Wal_Section_Covers_Range()
+    public async Task FullDiff_Logical_Stream_Covers_Range()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -77,11 +77,11 @@ public sealed class FullDifferentialTests
         await src.BackupDiffAsync(diffPath, fullPath);
 
         var bytes = await _pg.ReadContainerFileAsync(diffPath);
-        var walSection = Helpers.WalkSections(bytes)
-            .FirstOrDefault(s => s.sectionType == Helpers.SectionWal);
+        var logicalSection = Helpers.WalkSections(bytes)
+            .FirstOrDefault(s => s.sectionType == Helpers.SectionLogicalStream);
 
-        Assert.True(walSection.sectionType == Helpers.SectionWal,
-            "DIFF .bak missing WAL section");
-        Assert.True(walSection.length > 0, "WAL section is empty");
+        Assert.True(logicalSection.sectionType == Helpers.SectionLogicalStream,
+            "DIFF .bak missing LOGICAL_STREAM section");
+        Assert.True(logicalSection.length > 0, "LOGICAL_STREAM section is empty");
     }
 }

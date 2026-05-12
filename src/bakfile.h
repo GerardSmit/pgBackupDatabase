@@ -13,8 +13,7 @@
 #define BAKSECTION_METADATA		0x01
 #define BAKSECTION_SCHEMA		0x02
 #define BAKSECTION_DATA			0x03
-#define BAKSECTION_WAL			0x04
-#define BAKSECTION_WAL_SEGMENTS	0x05
+#define BAKSECTION_LOGICAL_STREAM 0x04
 
 /* Data entry within DATA section */
 typedef struct BakDataEntry
@@ -73,6 +72,7 @@ typedef struct BakFileWriter
 	pg_cryptohash_ctx *entry_hash_ctx;
 	bool		entry_open;
 	struct StringInfoData *section_buf;
+	bool		section_direct;
 } BakFileWriter;
 
 /* Reader state for reading a .bak file */
@@ -87,6 +87,8 @@ typedef struct BakFileReader
 	char	   *section_plain;
 	size_t		section_plain_len;
 	size_t		section_plain_pos;
+	bool		section_direct;
+	off_t		section_end_offset;
 } BakFileReader;
 
 /* Writer API */

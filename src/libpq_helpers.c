@@ -73,6 +73,27 @@ try_libpq_connect(const char *host, const char *port,
 	return conn;
 }
 
+static void
+pgbu_libpq_notice_receiver(void *arg, const PGresult *res)
+{
+	const char *severity;
+	const char *message;
+	int			elevel = NOTICE;
+
+	(void) arg;
+
+	message = PQresultErrorField(res, PG_DIAG_MESSAGE_PRIMARY);
+	if (message == NULL || message[0] == '\0')
+		return;
+
+	severity = PQresultErrorField(res, PG_DIAG_SEVERITY);
+	if (severity != NULL && strcmp(severity, "WARNING") == 0)
+		elevel = WARNING;
+
+	ereport(elevel,
+			(errmsg("restore target: %s", message)));
+}
+
 /*
  * Return a freshly palloc'd copy of the first non-empty entry of the
  * unix_socket_directories GUC, or NULL if the GUC is unset/empty.
@@ -145,6 +166,7 @@ pgbu_connect_libpq(const char *dbname)
 				 errdetail("Tried Unix socket from unix_socket_directories and TCP localhost on port %s.",
 						   port_str)));
 
+	PQsetNoticeReceiver(conn, pgbu_libpq_notice_receiver, NULL);
 	return conn;
 }
 
@@ -397,6 +419,7 @@ pgbu_drop_temp_db_quiet(const char *temp_dbname)
 {
 	PGconn	   *admin = NULL;
 	char	   *sql;
+	char	   *quoted;
 	PGresult   *res;
 
 	PG_TRY();
@@ -410,11 +433,22 @@ pgbu_drop_temp_db_quiet(const char *temp_dbname)
 	}
 	PG_END_TRY();
 
-	sql = psprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)",
-				   pgbu_quote_db_identifier(temp_dbname));
-	res = PQexec(admin, sql);
-	if (res)
-		PQclear(res);
+	quoted = pgbu_quote_db_identifier(temp_dbname);
+	sql = psprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", quoted);
+	pfree(quoted);
+
+	PG_TRY();
+	{
+		res = pgbu_libpq_exec_interruptible(admin, sql);
+		if (res)
+			PQclear(res);
+	}
+	PG_CATCH();
+	{
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
 	pfree(sql);
 	PQfinish(admin);
 }

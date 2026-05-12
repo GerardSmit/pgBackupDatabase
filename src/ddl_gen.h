@@ -11,6 +11,9 @@ extern StringInfo ddl_gen_types(Oid db_oid);
 extern StringInfo ddl_gen_functions(Oid db_oid);
 extern StringInfo ddl_gen_sequences(Oid db_oid);
 extern StringInfo ddl_gen_views(Oid db_oid);
+extern StringInfo ddl_gen_rules(Oid db_oid);
+extern StringInfo ddl_gen_triggers(Oid db_oid);
+extern StringInfo ddl_gen_row_security(Oid db_oid);
 extern StringInfo ddl_gen_constraints(Oid db_oid);
 extern StringInfo ddl_gen_all(Oid db_oid);
 

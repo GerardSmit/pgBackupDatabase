@@ -14,6 +14,48 @@
 #include "libpq_helpers.h"
 #include "restore_simple.h"
 
+static char *
+libpq_copy_column_list(PGconn *conn, const char *schema,
+					   const char *relname, const char *path)
+{
+	const char *params[2];
+	PGresult   *res;
+	ExecStatusType st;
+	char	   *cols;
+
+	params[0] = schema;
+	params[1] = relname;
+	res = PQexecParams(conn,
+					   "SELECT string_agg(quote_ident(a.attname), ', ' "
+					   "                  ORDER BY a.attnum) "
+					   "FROM pg_class c "
+					   "JOIN pg_namespace n ON c.relnamespace = n.oid "
+					   "JOIN pg_attribute a ON a.attrelid = c.oid "
+					   "WHERE n.nspname = $1 "
+					   "  AND c.relname = $2 "
+					   "  AND a.attnum > 0 "
+					   "  AND NOT a.attisdropped "
+					   "  AND a.attgenerated = ''",
+					   2, NULL, params, NULL, NULL, 0);
+	st = PQresultStatus(res);
+	if (st != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
+	{
+		char	   *msg = pstrdup(PQerrorMessage(conn));
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not enumerate restore columns for \"%s\"",
+						path),
+				 errdetail("%s", msg)));
+	}
+
+	cols = pstrdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return cols;
+}
+
 static void
 libpq_copy_in(PGconn *conn, const char *path, const char *data, size_t data_len)
 {
@@ -23,6 +65,7 @@ libpq_copy_in(PGconn *conn, const char *path, const char *data, size_t data_len)
 	const char *dot;
 	char	   *schema;
 	char	   *relname;
+	char	   *cols;
 	int			r;
 
 	dot = strchr(path, '.');
@@ -33,12 +76,15 @@ libpq_copy_in(PGconn *conn, const char *path, const char *data, size_t data_len)
 						path)));
 	schema = pnstrdup(path, dot - path);
 	relname = pstrdup(dot + 1);
+	cols = libpq_copy_column_list(conn, schema, relname, path);
 
 	initStringInfo(&copy_sql);
 	appendStringInfo(&copy_sql,
-					 "COPY %s.%s FROM STDIN (FORMAT binary)",
+					 "COPY %s.%s (%s) FROM STDIN (FORMAT binary)",
 					 pgbu_quote_db_identifier(schema),
-					 pgbu_quote_db_identifier(relname));
+					 pgbu_quote_db_identifier(relname),
+					 cols);
+	pfree(cols);
 
 	res = PQexec(conn, copy_sql.data);
 	st = PQresultStatus(res);
@@ -359,6 +405,8 @@ restore_simple(const char *target_db, char **files, int file_count,
 				pgbu_libpq_exec(conn, full->schema_sql, "SCHEMA");
 			}
 
+			pgbu_libpq_exec(conn, "SET session_replication_role = replica",
+							"disable restore triggers for SIMPLE data load");
 			for (k = 0; k < full->entry_count; k++)
 			{
 				BakDataEntry *e = &full->entries[k];
@@ -370,6 +418,8 @@ restore_simple(const char *target_db, char **files, int file_count,
 				libpq_copy_in(conn, e->path, full->entry_data[k],
 							  (size_t) e->data_len);
 			}
+			pgbu_libpq_exec(conn, "SET session_replication_role = origin",
+							"restore trigger firing mode after SIMPLE data load");
 
 			if (full->metadata_sql && full->metadata_sql[0])
 			{
@@ -506,6 +556,8 @@ restore_simple(const char *target_db, char **files, int file_count,
 				if (diff->schema_sql && diff->schema_sql[0])
 					pgbu_libpq_exec_schema_idempotent(conn, diff->schema_sql);
 
+				pgbu_libpq_exec(conn, "SET session_replication_role = replica",
+								"disable restore triggers for SIMPLE diff data load");
 				for (k = 0; k < diff->entry_count; k++)
 				{
 					BakDataEntry *e = &diff->entries[k];
@@ -518,6 +570,8 @@ restore_simple(const char *target_db, char **files, int file_count,
 					libpq_copy_in(conn, e->path, diff->entry_data[k],
 								  (size_t) e->data_len);
 				}
+				pgbu_libpq_exec(conn, "SET session_replication_role = origin",
+								"restore trigger firing mode after SIMPLE diff data load");
 
 				if (diff->metadata_sql && diff->metadata_sql[0])
 					pgbu_libpq_exec(conn, diff->metadata_sql, "METADATA (diff)");

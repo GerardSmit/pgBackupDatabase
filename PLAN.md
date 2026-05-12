@@ -1,720 +1,735 @@
-# pg_dbbackup: Per-Database PITR Backup Extension for PostgreSQL
+# pg_dbbackup: Per-Database Logical PITR Plan
 
-## Design Decisions Log
+## Goal
 
-### Decision 1: Native PG Extension (not external tool)
-**Options considered:** C# CLI tool, PowerShell scripts, native PG C extension.
-**Chosen:** Native C extension. `CREATE EXTENSION pg_dbbackup` — works everywhere PG runs, no external dependencies, uses PG internal APIs directly (XLogReader, do_pg_backup_start/stop, copydir).
+Build PostgreSQL backups that are genuinely per-database:
 
-### Decision 2: Foreground execution (not background worker)
-**Options considered:** Dynamic background worker, foreground SQL function.
-**Chosen:** Foreground. Verified that `do_pg_backup_start/stop`, `XLogReaderAllocate`, `copydir()` all work from regular backend processes — no walsender/recovery guards. Simpler architecture. Async variant deferred to last phase.
+- A `.bak` for one database must not contain raw WAL from other databases.
+- A `.bak` for one database must not contain `global/`, SLRU directories,
+  `pg_control`, or other cluster recovery state.
+- Point-in-time restore must stop on transaction boundaries and restore the
+  requested database only.
+- Extension support must be tested explicitly. Unsupported features must fail
+  loudly before backup/restore, not produce a misleading backup.
 
-### Decision 3: SIMPLE + FULL recovery modes
-**Inspired by:** SQL Server's per-database recovery models.
-**SIMPLE:** Logical backup (DDL + COPY binary). Smaller, faster restore, cross-PG-version. No PITR.
-**FULL:** Physical backup (files + filtered WAL). PITR enabled. Block-level differential.
-Both require `wal_level = replica` — SIMPLE needs it for incremental change detection via WAL summaries.
-
-### Decision 4: Three backup types (SQL Server naming)
-**Options considered:** Separate DIFF/INCREMENTAL/LOG, merged DIFF+INCREMENTAL, two types only.
-**Chosen:** Three types matching SQL Server: FULL, DIFFERENTIAL, LOG.
-- DIFFERENTIAL = changes since last FULL (cumulative, both modes). Merged "incremental" (SIMPLE) and "differential" (FULL) under one name.
-- LOG = WAL-only since last backup (FULL mode only). Lightweight PITR extension.
-
-### Decision 5: Single .bak file format
-**Options considered:** Directory layout, tar archive, custom binary.
-**Chosen:** Custom `.bak` binary format. One self-contained file per backup. Portable. Magic bytes at both ends. JSON header (always readable). Sections: METADATA, SCHEMA, DATA, WAL. SHA-256 checksums.
-
-### Decision 6: Compression + encryption in v1
-**Compression:** zstd per-section. Default on. Header always uncompressed.
-**Encryption:** AES-256-GCM with PBKDF2 key derivation. Password-based. Salt+IV per file in header. Compress first, then encrypt.
-
-### Decision 7: Restore via temp DB + rename
-**Options considered:** Shadow cluster (initdb), in-place restore, temp DB + rename.
-**Chosen:** Create temp DB → inject data → rename. Supports replacing existing DB safely. `ALTER DATABASE RENAME` verified: needs AccessExclusiveLock + zero connections. Cleanup drops temp DB on error.
-
-### Decision 8: WAL filtering by database OID
-**Core insight:** Every WAL record's block references contain `RelFileLocator { spcOid, dbOid, relNumber }`. Filter by `dbOid` + always include cluster-wide rmgrs (XLOG, XACT, CLOG, MULTIXACT, STANDBY, DBASE, RELMAP).
-
-### Decision 9: Extension compatibility verified
-**TimescaleDB:** Standard heap tables, no custom WAL rmgrs. Track extension version in metadata.
-**pgvector:** Standard heap + custom index AMs. FULL mode preserves index files.
-**pg_textsearch:** Standard heap + BM25 index (Generic XLOG). Segment files captured in FULL mode.
-**pgdog:** External proxy, no DB state. No impact.
+The native PostgreSQL crash-recovery path is cluster-scoped. It is not the
+primary design for this extension. Native recovery can remain only as a
+separate experimental/diagnostic mode; it must not be used for the per-database
+PITR product path.
 
 ---
 
-## Context
+## Core Decision
 
-PostgreSQL has no per-database physical backup. `pg_basebackup` = cluster-level only. `pg_dump` = logical only (no PITR). SQL Server has `BACKUP DATABASE`, `BACKUP LOG`, `RESTORE DATABASE ... FROM DISK` with `.bak` files — per-database, online, portable.
+Use a per-database logical change log for PITR.
 
-**Goal:** Native PostgreSQL C extension. `CREATE EXTENSION pg_dbbackup`. SQL Server-style `.bak` files and backup types (FULL, DIFFERENTIAL, LOG). Two recovery modes (SIMPLE/FULL). Compression + encryption. Transfer `.bak` files between engines.
+The SQL Server-style names remain:
 
-**Prerequisite:** `wal_level = replica` for both modes.
+| Mode | Meaning |
+|------|---------|
+| SIMPLE | Per-database logical snapshot. Restore to the backup point only. |
+| FULL | Per-database logical snapshot plus per-database logical LOG chain. Restore to any captured transaction timestamp. |
 
----
-
-## Recovery Modes
-
-| | SIMPLE | FULL |
-|---|--------|------|
-| Backup format | Logical (DDL + COPY binary) in `.bak` | Physical (files + filtered WAL) in `.bak` |
-| Full | Yes | Yes |
-| Differential | Yes (re-dump changed tables) | Yes (changed blocks + WAL) |
-| Log | **No** | Yes (WAL-only, extends PITR) |
-| PITR | **No** — point-of-backup only | **Yes** — any timestamp |
-| Cross-PG-version restore | **Yes** | No |
+This changes the old meaning of FULL. FULL is no longer "physical files plus
+filtered WAL". FULL is "logical base plus logical PITR logs".
 
 ---
 
-## Backup Types (SQL Server naming)
+## Non-Negotiable Constraints
 
-### FULL
-Complete backup. Both modes.
-- SIMPLE: DDL + COPY binary of all tables
-- FULL: all database files + WAL extract for backup window
+1. No cluster-scoped raw WAL in normal `.bak` files.
+2. No copied `global/`, `pg_xact/`, `pg_multixact/`, `pg_subtrans/`,
+   `pg_commit_ts/`, or `pg_control` in normal `.bak` files.
+3. No physical PostgreSQL startup recovery for the normal per-database path.
+4. LOG backups must be database-scoped by construction.
+5. Restore must apply complete committed transactions only.
+6. If a feature cannot be represented logically, backup must reject it or mark
+   the backup as requiring an explicit adapter.
 
-### DIFFERENTIAL
-Changes since last FULL backup (cumulative). Both modes. Only need latest DIFF — not a chain.
-- SIMPLE: re-dump changed tables (detected via WAL summaries PG17+ or file mtime)
-- FULL: changed blocks + WAL extract for `[full_stop_lsn, diff_stop_lsn]`
+---
 
-### LOG
-WAL since last backup of any type. **FULL mode only.** Sequential chain — need ALL log .baks.
-- WAL extract only, no data copy
-- Lightweight — extends PITR window between diffs
+## v1 Support Gate
 
-### Backup chain patterns
+`SUPPORT_MATRIX.md` is part of the v1 contract. FULL, DIFFERENTIAL, and LOG
+backups validate the current database before writing output or advancing the
+logical chain.
+
+The rule is simple:
+
+- Supported PostgreSQL and TimescaleDB features must have restore tests.
+- Unsupported physical/external features must raise `feature_not_supported`
+  before backup.
+- Silent omission is a bug.
+
+Current supported PostgreSQL coverage includes triggers, RLS policies,
+partitioned tables, identity/generated columns, domains, enums, views, rewrite
+rules, sequences, large objects, grants/owners, extensions, and LOG-window DDL.
+
+Current hard rejections include unlogged tables, foreign tables, regular
+materialized views, ordinary table inheritance, user event triggers, custom
+range/base/pseudo types, custom text search configurations, user aggregates,
+publications, and subscriptions.
+
+---
+
+## High-Level Architecture
 
 ```
-SIMPLE:  FULL.bak ─── DIFF.bak ─── DIFF.bak ─── FULL.bak
-         Restore = FULL + latest DIFF
-
-FULL:    FULL.bak ─── DIFF.bak ─── LOG.bak ─── LOG.bak ─── FULL.bak
-         Restore = FULL + latest DIFF + all LOGs after DIFF
-                   ◄────────────── PITR anywhere in range ──────────────►
+Source database
+  |
+  | FULL backup
+  |   - schema/metadata
+  |   - table data snapshot
+  |   - slot/checkpoint metadata
+  v
+full.bak
+  |
+  | LOG backup(s)
+  |   - logical transactions for this database only
+  |   - DDL frames
+  |   - sequence frames
+  |   - extension adapter frames
+  v
+log_001.bak, log_002.bak, ...
+  |
+  | Restore
+  |   - create temp DB
+  |   - load FULL snapshot
+  |   - replay LOG transactions until stop_at
+  |   - rebuild derived indexes
+  |   - run extension post-restore adapters
+  |   - rename temp DB to target
+  v
+Target database
 ```
+
+Logical decoding slots are database-scoped, so they are the correct primitive
+for per-database LOG backups. FULL-mode chain slots must be PostgreSQL
+failover logical slots so a correctly configured physical standby can
+synchronize the slot and continue the backup chain after promotion.
 
 ---
 
-## SQL Interface
+## `.bak` Format v1
 
-```sql
--- Configure recovery mode per database
-SELECT pg_dbbackup_set_mode('mydb', 'simple');
-SELECT pg_dbbackup_set_mode('mydb', 'full');
-SELECT pg_dbbackup_get_mode('mydb');
+The existing container format stays: magic bytes, JSON header, framed sections,
+optional zstd compression, optional AES-256-GCM encryption, per-entry checksums,
+whole-file checksum.
 
--- BACKUP DATABASE (each call = one .bak file)
-SELECT pg_dbbackup('mydb', '/backup/mydb_full.bak');
-SELECT pg_dbbackup('mydb', '/backup/mydb_diff.bak', type := 'differential');
-SELECT pg_dbbackup('mydb', '/backup/mydb_log.bak', type := 'log');
+The section model changes.
 
--- With compression + encryption
-SELECT pg_dbbackup('mydb', '/backup/mydb.bak',
-    compress := true,              -- default: true
-    password := 'my-secret');      -- default: NULL (no encryption)
+| Section | FULL | DIFF | LOG | Purpose |
+|---------|------|------|-----|---------|
+| `METADATA` | yes | yes | optional | Extensions, roles referenced, grants, DB settings, support manifest. |
+| `SCHEMA` | yes | yes | no | Replayable DDL for database objects. |
+| `DATA` | yes | yes | no | Table snapshots using binary COPY payloads. |
+| `MANIFEST` | yes | yes | yes | Object inventory, dependencies, feature flags, adapter requirements. |
+| `LOGICAL_STREAM` | no | optional | yes | Transactional logical changes for this database. |
+| `DDL_STREAM` | no | optional | yes | Ordered DDL/event frames that must replay with the log. |
+| `SEQUENCE_STREAM` | yes | optional | yes | Sequence state snapshots and sequence changes. |
+| `LARGE_OBJECTS` | yes | optional | yes | Large object snapshots and changes, if supported. |
+| `EXTENSION_STREAM` | yes | optional | yes | Adapter-specific payloads, e.g. TimescaleDB. |
 
--- RESTORE DATABASE (provide .bak files in order)
-SELECT pg_dbrestore('mydb',
-    files := ARRAY['/backup/full.bak', '/backup/diff.bak',
-                   '/backup/log1.bak', '/backup/log2.bak'],
-    stop_at := '2026-01-15 14:30:00',
-    password := 'my-secret');
+Removed from normal per-database backups:
 
--- Restore to different name
-SELECT pg_dbrestore('mydb',
-    files := ARRAY['/backup/full.bak'],
-    target_db := 'mydb_copy');
+- `WAL_SEGMENTS`
+- raw 16 MB WAL files
+- `global/`
+- `pg_xact/`, `pg_multixact/`, `pg_subtrans/`, `pg_commit_ts/`
+- `pg_control`
 
--- Inspect .bak files (like SQL Server RESTORE HEADERONLY / FILELISTONLY)
-SELECT * FROM pg_dbbackup_header('/backup/mydb.bak');
-SELECT * FROM pg_dbbackup_filelist('/backup/mydb.bak');
+### Header Fields
 
--- Verify .bak file integrity
-SELECT * FROM pg_dbbackup_verify('/backup/mydb.bak');
-```
+Required header fields:
 
-**Validation:**
-- `type := 'log'` with SIMPLE mode → error
-- `stop_at` on SIMPLE backups → error: "PITR requires FULL mode"
-- Restore validates chain: first = FULL, then DIFF (optional), then LOGs; LSN continuity checked
-- Default mode: SIMPLE
-- `password` required on restore if `.bak` was encrypted
+- `format_version`
+- `backup_id`
+- `chain_id`
+- `mode`
+- `type`
+- `db_name`
+- `db_oid`
+- `pg_version`
+- `created_at`
+- `base_snapshot_lsn`
+- `start_lsn`
+- `stop_lsn`
+- `stop_commit_time`
+- `previous_stop_lsn`
+- `logical_plugin`
+- `logical_slot_name`
+- `logical_slot_failover`
+- `requires_wal_level`
+- `compressed`
+- `encrypted`
+- `checksum_algo`
+- `feature_manifest_hash`
 
----
-
-## .bak File Format
-
-Single self-contained binary file. Portable across machines.
-
-### Binary Layout
-
-```
-┌─────────────────────────────────────────┐
-│ Magic: "PGBAK" (5 bytes)                │
-│ Format Version: uint16                  │
-│ Header Length: uint32                   │
-├─────────────────────────────────────────┤
-│ Header (JSON, uncompressed, unencrypted)│
-│   mode, type, db_name, db_oid,          │
-│   start_lsn, stop_lsn, timeline,       │
-│   pg_version, created_at,              │
-│   base_backup_lsn (for diff/log),      │
-│   compressed, compression_algo,         │
-│   encrypted, encryption_algo,           │
-│   key_salt (hex), key_iv (hex),         │
-│   file_count, checksum_algo             │
-├─────────────────────────────────────────┤
-│ Section: METADATA                       │
-│   Type: 0x01 | Length: uint64           │
-│   [compressed then encrypted if set]    │
-│   Data: SQL script (extensions, grants) │
-├─────────────────────────────────────────┤
-│ Section: SCHEMA (SIMPLE mode only)      │
-│   Type: 0x02 | Length: uint64           │
-│   Data: DDL SQL script                  │
-├─────────────────────────────────────────┤
-│ Section: DATA                           │
-│   Type: 0x03 | Entry count: uint32     │
-│   Per entry:                            │
-│     Path: uint16 len + bytes            │
-│     Data: uint64 len + bytes            │
-│     Checksum: SHA-256 (32 bytes)        │
-├─────────────────────────────────────────┤
-│ Section: WAL (FULL mode, full/diff/log) │
-│   Type: 0x04 | Length: uint64           │
-│   Data: (uint32 len, XLogRecord) pairs  │
-├─────────────────────────────────────────┤
-│ Footer:                                 │
-│   File checksum: SHA-256 (32 bytes)     │
-│   Magic: "PGBAK" (5 bytes)             │
-└─────────────────────────────────────────┘
-```
-
-**Properties:**
-- Header always uncompressed + unencrypted (inspectable, contains no sensitive data)
-- Salt + IV in header → same password = different ciphertext per file
-- Sections: compress first (zstd), then encrypt (AES-256-GCM)
-- Magic at both ends → detects truncation
-- SHA-256 per data entry + whole-file checksum → detects corruption
-- 64-bit lengths → supports files >2GB
-- Streamable: sequential write, no seeking during backup
-
-### Compression
-
-- Algorithm: zstd (fast, good ratio, already in PG ecosystem)
-- Applied per-section (header always uncompressed)
-- `compress := true` (default) / `compress := false`
-- Stored in header: `"compressed": true, "compression_algo": "zstd"`
-
-### Encryption
-
-- Algorithm: AES-256-GCM (authenticated — detects tampering)
-- Key derivation: PBKDF2-HMAC-SHA256 from password + salt (PG has OpenSSL)
-- Applied per-section after compression (header never encrypted)
-- Salt (16 bytes) + IV (12 bytes) generated per file, stored in header
-- `password := 'secret'` enables encryption; NULL = plaintext
-- Restore with wrong password → error: "authentication failed" (GCM detects it)
+The header must be inspectable without the password and must not contain table
+data, secrets, raw row values, or role passwords.
 
 ---
 
-## .bak Contents Per Type
+## Logical Stream
 
-| Type | METADATA | SCHEMA | DATA | WAL |
-|------|----------|--------|------|-----|
-| SIMPLE FULL | Yes | DDL for all objects | COPY binary per table | — |
-| SIMPLE DIFF | Yes | DDL for new/changed | Only changed tables | — |
-| FULL FULL | Yes | — | All relation files + pg_filenode.map | WAL `[start, stop]` |
-| FULL DIFF | Yes | — | Changed blocks/files | WAL `[base_stop, diff_stop]` |
-| FULL LOG | Yes | — | — | WAL `[prev_stop, current]` |
+LOG backups store a sequence of frames. Frames are compressed/encrypted as a
+section payload, but remain structured internally.
 
----
+Core frame types:
 
-## Architecture
+| Frame | Purpose |
+|-------|---------|
+| `BEGIN` | Start transaction, includes xid and first LSN. |
+| `RELATION` | Relation identity, columns, types, replica identity, adapter tag. |
+| `INSERT` | Insert row values. |
+| `UPDATE` | Old key/full old row plus new row values. |
+| `DELETE` | Old key/full old row. |
+| `TRUNCATE` | Truncate one or more relations. |
+| `DDL` | Ordered DDL command or normalized DDL event. |
+| `SEQUENCE` | Sequence state after transaction. |
+| `LARGE_OBJECT` | Large object create/update/delete chunk. |
+| `EXTENSION` | Adapter-owned frame. |
+| `COMMIT` | Commit LSN and commit timestamp. |
+| `ABORT` | Optional diagnostic frame; restore ignores aborted changes. |
 
-### Execution Model
+Restore rule:
 
-Foreground execution. `do_pg_backup_start/stop`, `XLogReaderAllocate`, `copydir()`, SPI all verified to work from regular backend. Synchronous, interruptible via `CHECK_FOR_INTERRUPTS()`.
+- Apply a transaction only if it commits and `commit_time <= stop_at`.
+- Stop before the first committed transaction with `commit_time > stop_at`.
+- Never apply half a transaction.
 
-### Mode Configuration
-
-```sql
-CREATE TABLE pg_dbbackup.db_config (
-    db_oid  oid PRIMARY KEY,
-    db_name text NOT NULL,
-    mode    text NOT NULL DEFAULT 'simple' CHECK (mode IN ('simple', 'full'))
-);
-```
-
-### Backup Flows
-
-**SIMPLE FULL → .bak:**
-1. `AccessShareLock` on database
-2. `BEGIN ISOLATION LEVEL REPEATABLE READ`
-3. Open `.bak` file, write magic + header
-4. Generate + write METADATA section (extensions, grants, ACLs)
-5. Generate + write SCHEMA section (DDL, dependency-ordered via `pg_depend`)
-6. Write DATA section: `COPY table TO STDOUT (FORMAT binary)` per table
-7. `COMMIT`
-8. Write footer checksum + magic
-
-**SIMPLE DIFFERENTIAL → .bak:**
-1. Read base FULL `.bak` header → get timestamp + table list
-2. Detect changed tables (WAL summaries PG17+ or file mtime)
-3. Same flow but only changed tables + new/altered DDL
-
-**FULL FULL → .bak:**
-1. `AccessShareLock` on database
-2. Create temp replication slot to pin WAL
-3. `do_pg_backup_start("pg_dbbackup", true, NULL, &bstate, NULL)`
-4. Open `.bak`, write magic + header
-5. Write METADATA section
-6. Write DATA section: read files from `base/{dboid}/`, tablespaces, `global/pg_filenode.map`
-7. `do_pg_backup_stop(&bstate, true)` → `stop_lsn`
-8. Write WAL section: XLogReader filters WAL `[start_lsn, stop_lsn]`
-9. Write footer
-10. Drop replication slot
-
-**FULL DIFFERENTIAL → .bak:**
-- Read base FULL `.bak` header → `stop_lsn`
-- WAL summaries or mtime → changed blocks for `dbOid`
-- DATA section: only changed files/blocks
-- WAL section: filter `[base_stop_lsn, diff_stop_lsn]`
-
-**FULL LOG → .bak:**
-- `pg_switch_wal()` to close current segment
-- WAL section only: filter `[prev_stop_lsn, current_lsn]`
-- No DATA section
-
-### Restore Flow
-
-```sql
-SELECT pg_dbrestore('mydb',
-    files := ARRAY['/full.bak', '/diff.bak', '/log1.bak', '/log2.bak'],
-    stop_at := '2026-01-15 14:30:00',
-    password := 'secret');
-```
-
-1. Read + validate header from each `.bak`:
-   - First must be FULL
-   - Optional DIFF (latest only, cumulative)
-   - Optional LOG chain (all needed, sequential)
-   - LSN continuity
-   - Same `db_name` across all
-   - Decrypt check (wrong password → immediate error)
-2. Create temp database `_pg_dbbackup_restore_{random}` from `template0`
-
-**SIMPLE restore:**
-3. Connect to temp database
-4. Execute SCHEMA from FULL `.bak` (+ DDL changes from DIFF if present)
-5. COPY FROM for each table in FULL `.bak`
-6. Apply DIFF `.bak`: truncate + COPY FROM changed tables
-7. Execute METADATA (extensions, grants)
-
-**FULL restore:**
-3. `AccessExclusiveLock` on temp database
-4. Clear `base/{temp_dboid}/`
-5. Extract DATA from FULL `.bak` → write to `base/{temp_dboid}/`
-6. Apply DIFF `.bak` DATA: overwrite changed files/blocks
-7. Replay WAL from each `.bak` in order (FULL WAL → DIFF WAL → LOG WALs):
-   - OID remap `dbOid` original → temp
-   - Stop at first commit where `xact_time > stop_at` (PITR)
-8. Update `pg_database`: `datfrozenxid`, `datminmxid`
-9. Execute METADATA
-
-**Both modes (final):**
-10. If target exists: `DROP DATABASE target_db`
-11. `ALTER DATABASE _pg_dbbackup_restore_{random} RENAME TO target_db`
-12. On error: `DROP DATABASE _pg_dbbackup_restore_{random}`
+If `track_commit_timestamp` is unavailable, the output plugin must use the
+commit timestamp available to logical decoding. If neither is available, PITR
+by timestamp is unsupported and backup must reject FULL mode.
 
 ---
 
-## WAL Filter (FULL mode only)
+## Source Capture
 
-Include if ANY of:
+### FULL Backup
 
-| Condition | Why |
-|-----------|-----|
-| Block ref `rlocator.dbOid == targetDbOid` | Database data |
-| `xl_rmid` in {XLOG, XACT, CLOG, MULTIXACT, STANDBY} | Cluster-wide consistency |
-| `xl_rmid == RM_DBASE_ID` | Database create/drop |
-| `xl_rmid == RM_RELMAP_ID` | Relation map updates |
+1. Verify `wal_level = logical`.
+2. Create or reuse a chain-owned failover logical replication slot for the
+   database.
+3. Export a consistent snapshot tied to the slot start LSN.
+4. Dump schema, metadata, manifest, sequence state, large objects, and table
+   data under that snapshot.
+5. Record `base_snapshot_lsn` and initialize chain metadata.
+6. Keep the failover logical slot until LOG backups have advanced the chain or
+   the chain is explicitly closed.
 
-```c
-static bool
-wal_filter_should_include(DecodedXLogRecord *rec, Oid target_db_oid)
-{
-    RmgrId rmid = rec->header.xl_rmid;
+The FULL `.bak` contains only the selected database's logical contents.
 
-    if (rmid == RM_XLOG_ID || rmid == RM_XACT_ID || rmid == RM_CLOG_ID ||
-        rmid == RM_MULTIXACT_ID || rmid == RM_STANDBY_ID ||
-        rmid == RM_DBASE_ID || rmid == RM_RELMAP_ID)
-        return true;
+### LOG Backup
 
-    for (int i = 0; i <= rec->max_block_id; i++)
-    {
-        DecodedBkpBlock *blk = &rec->blocks[i];
-        if (blk->in_use && blk->rlocator.dbOid == target_db_oid)
-            return true;
-    }
-    return false;
-}
-```
+1. Read chain metadata and the previous confirmed LSN.
+2. Verify the chain slot exists, is owned by `pg_dbbackup`, and has
+   `failover = true`.
+3. Decode changes from the chain slot up to a safe stop LSN.
+4. Write logical frames for the selected database only.
+5. Persist the `.bak` and verify its checksum.
+6. Advance the slot only after the `.bak` is durable.
+7. Update chain metadata with `stop_lsn` and `stop_commit_time`.
 
----
+### HA Failover
 
-## Database Metadata (Both Modes)
+The extension creates `_pg_dbbackup_<dboid>` as a failover logical slot. Actual
+slot survival across primary promotion is a PostgreSQL cluster responsibility:
+the primary/standby pair must use a physical replication slot,
+`hot_standby_feedback = on`, `sync_replication_slots = on` on the standby, and
+`synchronized_standby_slots` on the primary. After promotion, backup jobs must
+connect directly to the promoted primary.
 
-METADATA section in every `.bak`:
+Before planned promotion, operators should call
+`dbbackup.pg_dbbackup_failover_slot_status('<db>')` or
+`dbbackup.pg_dbbackup_failover_slot_ready('<db>')` on the candidate standby.
+Only `synced = true`, `temporary = false`, and `invalidation_reason IS NULL`
+is a safe continuation point. If the promoted primary does not have that
+persistent synced failover slot, LOG/DIFFERENTIAL backup must refuse to
+continue and a new FULL backup is required.
 
-| What | Source | Restore |
-|------|--------|---------|
-| Extensions | `pg_extension` | `CREATE EXTENSION IF NOT EXISTS` |
-| Extension versions | `extversion` | `ALTER EXTENSION ... UPDATE TO` |
-| Schemas | `pg_namespace` | `CREATE SCHEMA` |
-| Role grants on DB | `pg_database` ACL | `GRANT ... ON DATABASE` |
-| Default ACLs | `pg_default_acl` | `ALTER DEFAULT PRIVILEGES` |
-| Object grants | `information_schema` | `GRANT ... ON ...` |
-| Comments | `pg_description` | `COMMENT ON` |
-| DB-level config | `pg_db_role_setting` | `ALTER DATABASE SET` |
+### PgDog And SQL Proxies
 
-Roles are cluster-level. Backup records referenced roles. Restore warns if missing.
+PgDog is a routing layer, not a PostgreSQL recovery mechanism. Backup jobs must
+be routed to the current primary because FULL/DIFFERENTIAL/LOG backup writes
+server-side files and manages logical replication slots. If PgDog sends the
+request to a hot standby, PostgreSQL rejects it; the extension must not try to
+discover and contact the primary from inside a backend process.
 
----
+Required behavior:
 
-## Project Structure
+- a PgDog route targeting the primary can run FULL backup successfully
+- a direct standby connection rejects backup
+- a PgDog route targeting the standby rejects backup
+- standby read sessions must still work when `pg_dbbackup` is preloaded and a
+  FULL chain exists, so transaction-end journals skip recovery/read-only
+  transactions
 
-```
-D:\Sources\pgBackupDatabase\
-  pg_dbbackup.control
-  Makefile
-  sql/
-    pg_dbbackup--1.0.0.sql
-  src/
-    pg_dbbackup.c                       # _PG_init, PG_MODULE_MAGIC, SQL entries
-    bakfile.c / bakfile.h               # .bak format: write/read/verify
-    bakfile_crypto.c / bakfile_crypto.h # Compression (zstd) + encryption (AES-256-GCM)
-    backup_simple.c / backup_simple.h   # SIMPLE: full + differential
-    backup_full.c / backup_full.h       # FULL: full + differential + log
-    restore_simple.c / restore_simple.h # SIMPLE restore
-    restore_full.c / restore_full.h     # FULL restore + PITR
-    wal_filter.c / wal_filter.h         # XLogReader WAL filter
-    ddl_gen.c / ddl_gen.h               # DDL generation from catalogs
-    metadata_gen.c / metadata_gen.h     # metadata.sql generation
-    inspect.c / inspect.h               # header/filelist/verify SRFs
-    fileio.c / fileio.h                 # Safe file I/O wrappers
-  test/
-    conftest.py
-    test_bakfile_format.py
-    test_bakfile_crypto.py              # Compression + encryption tests
-    test_simple_full.py
-    test_simple_diff.py
-    test_simple_restore.py
-    test_full_backup.py
-    test_full_diff.py
-    test_full_log.py
-    test_full_restore.py
-    test_pitr.py
-    test_metadata.py
-    test_inspect.py                     # header/filelist/verify
-    test_wal_filter.py
-    test_replace_db.py
-    test_mode_config.py
-    test_cross_version.py
-    test_portability.py                 # .bak transfer between machines
-    test_timescaledb.py                 # TimescaleDB hypertable/chunk/cagg tests
-    test_pgvector.py                    # pgvector HNSW/IVFFlat/vector data tests
-    test_pg_textsearch.py               # pg_textsearch BM25 index tests
-    test_pgdog.py                       # Backup through pgdog proxy
-    test_multi_extension.py             # Combined extension scenarios
-    helpers/
-      pg_container.py
-      time_helpers.py
-      data_fixtures.py
-```
+### DIFFERENTIAL Backup
+
+DIFFERENTIAL is implemented as a cumulative logical stream since the base FULL.
+It is a restore-speed optimization, not a PITR requirement.
 
 ---
 
-## Test Strategy
+## DDL Capture
 
-### Framework
+PostgreSQL logical replication does not automatically replicate DDL. This
+extension must capture DDL itself.
 
-pytest + TestContainers against real PostgreSQL 17. Extension compiled + installed into container.
+Implemented mechanism:
 
-### PITR Time Control
+- Event triggers for `ddl_command_end` and `sql_drop`.
+- A `dbbackup.ddl_log` catalog for inspection and replay diagnostics.
+- The logical output plugin decodes `dbbackup.ddl_log` rows specially, so DDL
+  is ordered transactionally with DML.
+- A future `ProcessUtility_hook` can be added only for command families proven
+  insufficient through tests.
 
-`pg_sleep(1)` gaps + captured `now()` timestamps + `track_commit_timestamp = on`.
+DDL frames must include:
 
-### Test Matrix
+- original command text where safe and useful
+- normalized object identity
+- schema-qualified object names
+- dependency information
+- extension ownership flag
+- adapter ownership flag
 
-**Mode config + validation:**
-
-| Test | Verifies |
-|------|----------|
-| `test_default_mode_simple` | Default SIMPLE |
-| `test_set_mode_full` | Switch works |
-| `test_log_rejected_simple` | LOG errors in SIMPLE |
-| `test_pitr_rejected_simple` | stop_at errors on SIMPLE .bak |
-
-**.bak format:**
-
-| Test | Verifies |
-|------|----------|
-| `test_bak_magic_bytes` | PGBAK at start + end |
-| `test_bak_header_json` | Header parseable |
-| `test_bak_footer_checksum` | SHA-256 whole file |
-| `test_bak_truncation_detected` | Missing end magic |
-| `test_bak_corruption_detected` | Modified bytes caught |
-
-**Compression + encryption:**
-
-| Test | Verifies |
-|------|----------|
-| `test_compressed_smaller` | Compressed .bak < uncompressed |
-| `test_compressed_roundtrip` | Compress → decompress = identical |
-| `test_encrypted_not_readable` | Encrypted .bak sections not plaintext |
-| `test_encrypted_roundtrip` | Encrypt → decrypt with correct password |
-| `test_wrong_password_fails` | Wrong password → error |
-| `test_same_password_different_ciphertext` | Different salt per file |
-| `test_compressed_then_encrypted` | Both flags work together |
-
-**SIMPLE mode:**
-
-| Test | Verifies |
-|------|----------|
-| `test_simple_full_bak` | .bak created with SCHEMA + DATA |
-| `test_simple_full_all_tables` | All tables in DATA section |
-| `test_simple_full_custom_types` | Enums, domains in SCHEMA |
-| `test_simple_full_concurrent` | Consistent snapshot |
-| `test_simple_diff_only_changed` | DIFF .bak smaller, changed tables only |
-| `test_simple_diff_new_tables` | New tables detected |
-| `test_simple_restore_basic` | .bak → restore → data matches |
-| `test_simple_restore_with_diff` | FULL + DIFF → correct state |
-| `test_simple_restore_cross_version` | PG17 .bak restores on PG18 |
-| `test_simple_restore_replaces` | Temp → rename workflow |
-
-**FULL mode:**
-
-| Test | Verifies |
-|------|----------|
-| `test_full_backup_bak` | .bak with DATA + WAL sections |
-| `test_full_backup_all_forks` | Main, FSM, VM in .bak |
-| `test_full_backup_concurrent` | Backup with concurrent DML |
-| `test_full_diff_smaller` | DIFF .bak smaller than FULL |
-| `test_full_log_wal_only` | LOG .bak has WAL, no DATA |
-| `test_full_restore_basic` | Restore → data matches |
-| `test_full_restore_chain` | FULL + DIFF + LOGs → correct |
-| `test_pitr_stops_correctly` | Data after stop_at absent |
-| `test_pitr_before_included` | Data before stop_at present |
-| `test_pitr_tx_boundary` | Uncommitted not visible |
-| `test_pitr_across_logs` | PITR in middle of LOG chain |
-
-**Shared:**
-
-| Test | Verifies |
-|------|----------|
-| `test_metadata_extensions` | Extensions restored |
-| `test_metadata_grants` | Grants preserved |
-| `test_metadata_settings` | DB config preserved |
-| `test_metadata_missing_role` | Warning for missing roles |
-| `test_chain_validation` | LSN gap → error |
-| `test_chain_wrong_order` | Wrong .bak order → error |
-| `test_cleanup_on_failure` | Temp DB dropped on error |
-| `test_wal_filter_includes_db` | Correct WAL filtering |
-| `test_wal_filter_excludes_other` | Other DB excluded |
-| `test_concurrent_backups` | Parallel backups work |
-| `test_requires_replica` | Error at wal_level=minimal |
-| `test_bak_portable` | .bak from container A restores on B |
-| `test_header_inspection` | pg_dbbackup_header() correct |
-| `test_filelist_inspection` | pg_dbbackup_filelist() lists entries |
-| `test_verify_valid` | pg_dbbackup_verify() passes |
-| `test_verify_corrupt` | pg_dbbackup_verify() catches corruption |
-
-**Extension compatibility (TimescaleDB, pgvector, pg_textsearch, pgdog):**
-
-| Test | Verifies |
-|------|----------|
-| `test_timescaledb_hypertable_backup_simple` | Hypertable + chunks backed up in SIMPLE mode |
-| `test_timescaledb_hypertable_restore_simple` | Hypertable queryable after SIMPLE restore |
-| `test_timescaledb_hypertable_backup_full` | Hypertable files + WAL captured in FULL mode |
-| `test_timescaledb_hypertable_restore_full` | Hypertable queryable after FULL restore |
-| `test_timescaledb_continuous_aggregate` | Continuous aggregates survive backup/restore |
-| `test_timescaledb_compression` | Compressed chunks restored correctly |
-| `test_timescaledb_extension_version` | Extension version preserved in metadata.sql |
-| `test_timescaledb_pitr` | PITR with TimescaleDB data at correct point |
-| `test_pgvector_data_backup_simple` | Vector columns backed up correctly (SIMPLE) |
-| `test_pgvector_data_restore_simple` | Vector data + similarity search works after restore |
-| `test_pgvector_hnsw_index_full` | HNSW index files captured in FULL backup |
-| `test_pgvector_hnsw_index_restore` | HNSW index usable after FULL restore (no rebuild) |
-| `test_pgvector_ivfflat_backup` | IVFFlat index backup/restore |
-| `test_pg_textsearch_bm25_backup_simple` | BM25 index + data backed up (SIMPLE) |
-| `test_pg_textsearch_bm25_restore_simple` | Search works after SIMPLE restore (index rebuild) |
-| `test_pg_textsearch_bm25_backup_full` | BM25 segment files captured in FULL mode |
-| `test_pg_textsearch_bm25_restore_full` | BM25 search works after FULL restore (no rebuild) |
-| `test_pgdog_backup_through_proxy` | Backup works when connected via pgdog proxy |
-| `test_multiple_extensions_combined` | DB with pgvector + pg_textsearch backs up + restores |
+DDL replay must be idempotent where possible, but it must not hide
+incompatibilities. A failed DDL replay fails restore.
 
 ---
 
-## Extension Compatibility
+## Sequence Capture
 
-### Compatibility Summary
+PostgreSQL logical replication does not keep sequence state synchronized.
 
-| Extension | Storage | Custom WAL rmgr | Custom Table AM | Backup Impact |
-|-----------|---------|----------------|-----------------|---------------|
-| **TimescaleDB** | Standard heap tables (chunks in `_timescaledb_internal`) | No | Optional hypercore (columnstore) | Track extension version; preserve `_timescaledb_internal` catalogs |
-| **pgvector** | Standard heap + custom index AMs (HNSW, IVFFlat) | No | No | Standard — indexes as relation files |
-| **pg_textsearch** | Standard heap + custom BM25 index AM (LSM segments) | No (uses Generic XLOG) | No | Standard — segments as relation files; memtable ephemeral |
-| **pgdog** | External proxy (no DB state) | N/A | N/A | No impact — stateless proxy |
+Required behavior:
 
-### Why These All Work
+- FULL stores all sequence definitions and current states.
+- LOG stores sequence state changes for sequences used after the FULL.
+- Restore sets sequences after applying all DML up to `stop_at`.
+- Identity columns are handled through their backing sequences.
 
-All four use **standard PostgreSQL heap tables** for data and **standard relation files** for indexes. No custom WAL resource managers. This means:
+Implemented behavior:
 
-- **FULL mode**: `copydir()` of `base/{dboid}/` captures everything — data, indexes, segments
-- **SIMPLE mode**: `COPY ... TO` exports all table data; DDL recreates tables, indexes rebuild on restore
-- **WAL filter**: all WAL records use standard rmgr IDs (RM_HEAP_ID, RM_BTREE_ID, RM_GENERIC_ID for pg_textsearch), filtered correctly by `dbOid`
+- FULL stores sequence definitions and current states.
+- A transaction-end journal records changed sequence state in
+  `dbbackup.sequence_log`.
+- The logical output plugin emits `setval` frames.
+- Restore applies the latest sequence state at or before `stop_at`.
 
-### TimescaleDB Special Handling
+---
 
-TimescaleDB needs extra care in metadata:
-1. **Extension version tracking**: `metadata.sql` must include exact version (`CREATE EXTENSION timescaledb VERSION 'x.y.z'`)
-2. **`shared_preload_libraries`**: document that TimescaleDB must be preloaded on restore target
-3. **Continuous aggregates**: WAL-based invalidation log is in standard tables — backed up normally
-4. **Compressed chunks**: stored as standard heap relations — backed up normally
-5. **Background jobs**: `_timescaledb_internal.bgw_job_stat` is a regular table — backed up
+## Large Objects
 
-### pgvector Notes
+Large objects are not covered by ordinary table logical replication.
 
-- Vector data in standard heap columns — COPY binary handles `vector` type natively (registered I/O functions)
-- HNSW/IVFFlat indexes: FULL mode preserves index files (no rebuild needed); SIMPLE mode requires `CREATE INDEX` on restore
+Implemented behavior:
 
-### pg_textsearch Notes
+- FULL snapshots large-object metadata, pages, ownership, grants, and comments.
+- A transaction-end journal records changed or unlinked large objects in
+  `dbbackup.large_object_log`.
+- LOG replay recreates the latest object snapshot or applies unlink behavior
+  transactionally with the surrounding logical stream.
 
-- BM25 index uses LSM-tree with segments stored as relation files — FULL mode captures all segments
-- In-memory memtable (DSA) is ephemeral — rebuilt from heap on startup after restore
-- SIMPLE mode: index must be rebuilt via `CREATE INDEX` (DDL in SCHEMA section)
-- Generic XLOG usage means WAL records use `RM_GENERIC_ID` — captured by WAL filter (block refs have correct `dbOid`)
+---
 
-### pgdog Notes
+## Derived Objects
 
-- External connection pooler written in Rust — no database state
-- Backup connects directly to PostgreSQL, not through proxy
-- No compatibility concerns
+Indexes are derived state and should normally be rebuilt, not replayed from
+physical pages.
+
+Restore policy:
+
+- Load tables first.
+- Apply logical LOG transactions.
+- Recreate indexes, constraints, materialized views, and extension-derived
+  indexes at the final PITR state.
+- For performance, allow indexes to be created before replay only when the
+  replay engine applies SQL DML through PostgreSQL and the behavior is tested.
+
+This is important for:
+
+- `pgvector` HNSW and IVFFlat indexes
+- `pg_textsearch` BM25 indexes
+- expression indexes
+- partial indexes
+- partitioned indexes
+
+---
+
+## Extension Adapter Model
+
+Every extension is assigned one support tier.
+
+| Tier | Meaning |
+|------|---------|
+| `transparent` | Works through normal schema/data/logical replay. |
+| `derived-index` | Data is logical; indexes are rebuilt after replay. |
+| `adapter` | Needs extension-specific capture/replay hooks. |
+| `blocked` | Backup rejects when the feature is present. |
+
+The manifest records required adapters and versions. Restore validates that
+required extensions and adapter versions are available before applying data.
+
+### pgvector
+
+Tier: `derived-index`
+
+Plan:
+
+- Vector column data is regular table data.
+- HNSW and IVFFlat indexes are rebuilt after restore.
+- Similarity query tests verify semantic correctness.
+
+### pg_textsearch
+
+Tier: `derived-index`
+
+Plan:
+
+- Table data is restored logically.
+- BM25 index files, segments, memtables, and CTID maps are not authoritative.
+- BM25 indexes are rebuilt after replay.
+- `shared_preload_libraries` must include `pg_textsearch` on the restore
+  target.
+
+### TimescaleDB
+
+Tier: `adapter`
+
+TimescaleDB is not just "normal tables". Hypertables, chunks, compression,
+continuous aggregates, background jobs, and policies require adapter logic.
+
+Adapter responsibilities:
+
+1. Run Timescale restore pre/post hooks when available.
+2. Restore extension version and validate binary compatibility.
+3. Capture hypertable definitions, dimensions, chunk metadata, compression
+   settings, policies, jobs, and continuous aggregate definitions.
+4. During LOG replay, map chunk-origin changes back to the hypertable root
+   where possible.
+5. Disable background jobs/policies during restore replay.
+6. Rebuild or refresh continuous aggregates after replay unless exact
+   invalidation-log replay is implemented and tested.
+7. Recompress chunks after replay if compression state cannot be safely
+   replayed transaction-by-transaction.
+8. Fail loudly for Timescale features not covered by tests.
+
+Current v1 coverage is green for hypertables, chunk DML replay through the
+root hypertable, multidimensional range/hash dimensions, continuous
+aggregates, retention policies, compression policies, refresh policies,
+FULL+LOG restore, and `stop_at` filtering.
+
+---
+
+## PostgreSQL Feature Test Matrix
+
+The project should not claim "PostgreSQL feature complete" without tests across
+these feature families.
+
+### Core DML and Transactions
+
+- INSERT, UPDATE, DELETE, TRUNCATE
+- multi-row statements
+- `INSERT ... ON CONFLICT`
+- transaction rollback
+- savepoint rollback
+- transaction touching multiple tables
+- transaction with DDL plus DML
+- stop_at before, inside, and after a LOG backup
+- stop_at on exact commit boundary
+- aborted transactions are not applied
+
+### Table Shapes
+
+- heap table
+- partitioned table
+- inherited table
+- table with TOAST values
+- generated columns
+- identity columns
+- default expressions
+- arrays, JSONB, ranges, enums, domains, composites
+- collations
+- nullable and NOT NULL columns
+- dropped columns
+
+### Constraints and Indexes
+
+- primary key
+- unique
+- foreign key
+- deferrable foreign key
+- check
+- exclusion
+- expression index
+- partial index
+- covering index
+- partitioned index
+- concurrent index build, if allowed by capture hooks
+
+### Schema Objects
+
+- schemas
+- views
+- materialized views
+- functions
+- procedures
+- triggers
+- rules
+- event triggers
+- operators and operator classes
+- casts
+- text search dictionaries/configurations
+- policies and row-level security
+- grants and default privileges
+- comments
+- database-level settings
+
+### Special Storage
+
+- sequences
+- large objects
+- unlogged tables
+- temporary tables
+- foreign tables
+- materialized view data
+
+Support policy:
+
+- Sequences: must be supported.
+- Large objects: supported through FULL snapshots and LOG snapshot/unlink
+  frames.
+- Unlogged tables: FULL snapshot may be supported; PITR changes must be
+  rejected unless a logical path is implemented.
+- Temporary tables: never backed up.
+- Foreign tables: DDL only unless an adapter is implemented.
+- Materialized views: definition plus refresh after restore unless data replay
+  is explicitly implemented.
+
+---
+
+## TimescaleDB Test Matrix
+
+TimescaleDB support requires tests for:
+
+- extension create/restore with exact version validation
+- hypertable create before FULL
+- hypertable create after FULL and before LOG
+- chunk creation during LOG window
+- INSERT into hypertable
+- UPDATE hypertable rows
+- DELETE hypertable rows
+- TRUNCATE hypertable
+- multi-dimensional hypertable
+- custom chunk interval
+- retention policy
+- compression or Hypercore enabled before FULL
+- compression or Hypercore enabled during LOG window
+- insert into compressed/columnstore-backed data when supported by Timescale
+- continuous aggregate definition
+- continuous aggregate refresh after restore
+- background jobs disabled during restore and re-enabled after
+- policies restored but not executed during replay
+- restore to a fresh database with Timescale preloaded
+- restore failure when Timescale is unavailable
+- PITR before a chunk exists
+- PITR after a chunk exists
+- PITR before and after compression policy effects
+
+If a Timescale feature cannot be supported, the test must assert that
+backup rejects it with a clear error.
+
+Current v1 coverage includes snapshot restore for hypertables, compressed
+chunks, continuous aggregates, and extension version preservation; LOG/PITR
+coverage includes INSERT-driven chunk creation and timestamp stop filtering.
+The remaining matrix items above are still required before claiming complete
+TimescaleDB feature coverage.
+
+---
+
+## Isolation and Security Tests
+
+The key product promise is per-database isolation. Add tests that prove it.
+
+- Create 100 databases.
+- Put a unique secret string in 99 non-target databases.
+- Generate heavy writes in non-target databases.
+- Back up the target database in FULL mode.
+- Verify the `.bak` does not contain non-target secret strings in plaintext
+  when unencrypted.
+- Verify filelist/manifest contains no non-target database objects.
+- Restore the target and verify only target data is present.
+- Repeat while non-target databases generate high WAL volume.
+
+This test prevents accidental reintroduction of raw WAL segments or cluster
+state into normal `.bak` files.
+
+---
+
+## Restore Algorithm
+
+1. Read and validate all headers.
+2. Validate same `chain_id`, same source database identity, continuous LSNs,
+   compatible PostgreSQL versions, and required adapters.
+3. Create temp database from `template0`.
+4. Install required extensions in dependency order.
+5. Apply schema and metadata.
+6. Load FULL DATA.
+7. Apply optional DIFF DATA.
+8. Replay LOG transactions in order until `stop_at`.
+9. Apply final sequence states.
+10. Rebuild derived indexes.
+11. Refresh materialized views or adapter-owned derived objects.
+12. Run extension post-restore adapters.
+13. Validate row counts/checksums/manifests where available.
+14. Drop existing target database if requested.
+15. Rename temp database to target.
+16. Drop temp database on error.
 
 ---
 
 ## Implementation Phases
 
-### Phase 1: Scaffold + .bak Format
-- `pg_dbbackup.control`, `Makefile`, SQL script, `src/pg_dbbackup.c` stubs
-- `src/bakfile.c`: .bak writer/reader (magic, header, sections, footer)
-- Config table + `set_mode/get_mode`
-- **Tests**: Extension loads, .bak roundtrip, mode config
+### Phase 0: Remove Cluster-Scoped PITR From Default Path
 
-### Phase 2: Compression + Encryption
-- `src/bakfile_crypto.c`: zstd compression + AES-256-GCM encryption per section
-- **Tests**: compress roundtrip, encrypt roundtrip, wrong password, combined
+- Done: raw WAL segment sections are not written by normal FULL/DIFF/LOG
+  backups.
+- Done: `global/`, SLRU, and `pg_control` are not captured by normal FULL
+  backups.
+- Done: subprocess native recovery and physical WAL replay were removed from
+  the v1 build/source path.
+- Done: isolation tests prove other database data does not enter `.bak`.
 
-### Phase 3: Metadata + DDL Generation
-- `src/metadata_gen.c`: extensions, grants, ACLs → SQL
-- `src/ddl_gen.c`: tables, indexes, types, functions → DDL (dependency-ordered)
-- **Tests**: metadata covers all objects, DDL ordering correct
+### Phase 1: `.bak` v1 Logical Sections
 
-### Phase 4: SIMPLE Full Backup
-- `src/backup_simple.c`: REPEATABLE READ → SCHEMA + DATA sections → .bak
-- **Tests**: `test_simple_full_bak`, `test_simple_full_all_tables`
+- Done: v1 normal path uses metadata, schema, data, and logical stream
+  sections. DDL, sequence, large-object, and extension-adapter frames are
+  represented in the logical stream and metadata sections.
+- Done: reader/writer tests cover the v1 section set.
 
-### Phase 5: SIMPLE Restore
-- `src/restore_simple.c`: read .bak → temp DB → DDL → COPY FROM → metadata → rename
-- **Tests**: `test_simple_restore_basic`, `test_simple_restore_replaces`
+### Phase 2: Chain and Slot Catalog
 
-### Phase 6: SIMPLE Differential
-- Change detection (WAL summaries / mtime)
-- DIFF .bak: changed tables only
-- Restore applies FULL + DIFF
-- **Tests**: `test_simple_diff_only_changed`, `test_simple_restore_with_diff`
+- Done: chain catalog table and deterministic slot naming are implemented.
+- Done: logical slots are created, consumed, and tracked per database.
+- Done: restore validates database name, backup type, differential placement,
+  and LSN continuity.
 
-### Phase 7: FULL Full Backup
-- `src/backup_full.c`: `do_pg_backup_start` → DATA + WAL sections → .bak
-- **Tests**: `test_full_backup_bak`, `test_full_backup_concurrent`
+### Phase 3: Logical Output Plugin
 
-### Phase 8: WAL Filter
-- `src/wal_filter.c`: XLogReader + filter → .bak WAL section
-- **Tests**: `test_wal_filter_includes_db`, `test_wal_filter_excludes_other`
+- Done: DML, truncate, DDL journal, sequence journal, and large-object journal
+  rows are emitted as replayable SQL frames.
+- Done: commit timestamp/LSN is emitted and used for PITR stop decisions.
+- Done: tables without replica identity are rejected for UPDATE/DELETE.
 
-### Phase 9: FULL Restore + PITR
-- `src/restore_full.c`: temp DB → file inject → WAL replay → OID remap → PITR
-- **Tests**: `test_full_restore_basic`, `test_pitr_stops_correctly`
+### Phase 4: FULL Snapshot Tied to Slot
 
-### Phase 10: FULL Differential + Log
-- DIFF .bak: changed blocks + WAL
-- LOG .bak: WAL only
-- Chain resolution in restore
-- **Tests**: `test_full_diff_smaller`, `test_full_restore_chain`, `test_pitr_across_logs`
+- Done: FULL snapshots are anchored to a logical slot start LSN.
+- Done: schema/data/metadata are dumped into the v1 `.bak`.
+- Done: LOG replay starts from the recorded chain position.
 
-### Phase 11: Inspection Functions
-- `pg_dbbackup_header()`, `pg_dbbackup_filelist()`, `pg_dbbackup_verify()` SRFs
-- **Tests**: inspection + verification tests
+### Phase 5: LOG Backup Writer
 
-### Phase 12: Extension Compatibility Testing
-- TimescaleDB: hypertable backup/restore, continuous aggregates, compressed chunks, PITR
-- pgvector: vector data, HNSW/IVFFlat index backup/restore, similarity search verification
-- pg_textsearch: BM25 index segments, search after restore, rebuild in SIMPLE mode
-- pgdog: backup through proxy connection
-- Combined: DB with multiple extensions
-- **Tests**: all `test_timescaledb_*`, `test_pgvector_*`, `test_pg_textsearch_*`, `test_pgdog_*`, `test_multi_extension_*`
+- Done: LOG/DIFF decode from the previous chain LSN to a safe stop LSN.
+- Done: logical stream frames are written directly to the `.bak`.
+- Done: the slot is consumed through the same logical decode used for the
+  backup, avoiding a second unsafe decode pass.
 
-Hint: Use https://hub.docker.com/r/gerardsmit/pg_textsearch - all the extensions are preinstalled and ready to use for testing.
+### Phase 6: Logical Replay Engine
 
-### Phase 13: Polish
-- Progress via NOTICE messages
-- Async variant with background worker
-- Documentation
+- Done: frames apply into a temp database.
+- Done: replay respects transaction commit boundaries and `stop_at`.
+- Done: multi-LOG, branch-after-restore, and failure-cleanup tests pass.
+
+### Phase 7: DDL, Sequence, and Large Object Support
+
+- Done: DDL, sequence state, and large objects are captured and replayed.
+- Done: tests cover DDL during LOG windows, standalone sequence PITR, and
+  large-object write/unlink behavior.
+
+### Phase 8: Derived Object Rebuild
+
+- Defer/rebuild indexes after replay.
+- Rebuild materialized views or refresh them.
+- Add pgvector and pg_textsearch tests.
+
+### Phase 9: TimescaleDB Adapter
+
+- Done: Timescale metadata capture covers hypertables, dimensions,
+  continuous aggregates, and policies.
+- Done: chunk DML replays through the root hypertable.
+- Done: Timescale test matrix currently passes.
+
+### Phase 10: PostgreSQL Feature Matrix
+
+- In progress: broad PostgreSQL feature tests now cover core DML,
+  transactions, DDL replay, indexes, roles/grants, extensions, sequences,
+  large objects, cross-container restore, and large indexed tables.
+- Continue adding green tests or explicit rejection tests for each newly found
+  feature family.
+
+### Phase 11: Performance and Operations
+
+- Done: plain sections stream directly to disk.
+- Done: table backup avoids table-sized backend buffers by chunking COPY temp
+  files into the `.bak`.
+- Done: FULL restore streams DATA entries into `COPY FROM` and verifies entry
+  checksums incrementally.
+- Done: logical replay uses one libpq round trip per committed transaction.
+- Implement streaming zstd/AES section framing.
+- Avoid the final full-file reread for footer checksums by changing the frame
+  layout so lengths/checksums are known before bytes are hashed.
+- Parallel table load.
+- Progress NOTICEs.
+- Chain inspection functions.
+- Slot lag reporting.
+- Backup size reporting.
+
+### Phase 12: Documentation and Migration
+
+- Update README and SQL reference.
+- Document physical/native PITR as removed from the normal path or as an
+  explicit experimental mode if retained.
+- Document exact support matrix.
+- Document operational requirements and failure modes.
 
 ---
 
-## Prerequisites
+## Definition of Done
 
-- `wal_level = replica` (or `logical`)
-- Superuser or `pg_write_server_files` role
-- PG15+ (modern backup APIs, XLogReader)
-- `track_commit_timestamp = on` (recommended for PITR precision)
-- OpenSSL (for AES-256-GCM encryption — PG already links it)
+The logical PITR design is complete when:
 
----
-
-## Risks and Mitigations
-
-| Risk | Mitigation |
-|------|-----------|
-| WAL recycled before reading | Temp replication slot pins WAL |
-| OID remapping edge cases | Include all global rmgrs; integration tests |
-| DDL generation misses cases | Compare vs pg_dump; iterate |
-| .bak format versioning | Version field in header; reader validates |
-| Large .bak (>2GB) | 64-bit lengths; streaming write |
-| Rename needs zero connections | Temp name, rename at end |
-| OpenSSL not available | Encryption optional; error if password given without OpenSSL |
+1. Done: FULL + LOG restores pass for plain PostgreSQL tables.
+2. Done: `FullRestore_Pitr_Stops_At_Timestamp` passes without raw WAL
+   segments, cluster state, or subprocess native recovery.
+3. Done: isolation tests prove other database data does not enter target
+   `.bak`.
+4. In progress: PostgreSQL feature matrix expands by test, with unsupported
+   behavior rejected explicitly.
+5. Done for current v1 scope: TimescaleDB matrix is green.
+6. Done: pgvector and pg_textsearch restore by rebuilding derived indexes.
+7. Done: failed restores leave no temp database behind.
+8. Done: README states the support matrix for this v1 implementation.
 
 ---
 
-## Key PostgreSQL Source References
+## Key PostgreSQL References
 
-| What | File |
-|------|------|
-| `do_pg_backup_start/stop` | `src/backend/access/transam/xlog.c` |
-| XLogReader API | `src/include/access/xlogreader.h` |
-| WAL record format | `src/include/access/xlogrecord.h` |
-| Resource manager IDs | `src/include/access/rmgrlist.h` |
-| `RelFileLocator` (dbOid) | `src/include/storage/relfilelocator.h` |
-| `copydir()` | `src/include/storage/copydir.h` |
-| Base backup reference | `src/backend/backup/basebackup.c` |
-| CREATE DATABASE | `src/backend/commands/dbcommands.c` |
-| RenameDatabase | `src/backend/commands/dbcommands.c:1918` |
-| pg_waldump XLogReader | `src/bin/pg_waldump/pg_waldump.c` |
-| pg_dump DDL/extensions | `src/bin/pg_dump/pg_dump.c` |
-| COPY binary format | `src/backend/commands/copyfromparse.c` |
-| SPI interface | `src/backend/executor/spi.c` |
-| OpenSSL in PG | `src/common/cryptohash_openssl.c` |
+Local PostgreSQL source is expected at `D:\Sources\postgres`.
+
+Important areas:
+
+| Topic | Source area |
+|-------|-------------|
+| Logical decoding API | `src/backend/replication/logical/` |
+| Output plugins | `src/include/replication/output_plugin.h` |
+| Replication slots | `src/backend/replication/slot.c` |
+| SQL slot functions | `src/backend/replication/logical/logicalfuncs.c` |
+| Event triggers | `src/backend/commands/event_trigger.c` |
+| ProcessUtility hook | `src/backend/tcop/utility.c` |
+| pg_dump schema logic | `src/bin/pg_dump/pg_dump.c` |
+| COPY binary | `src/backend/commands/copy*.c` |
+| Large objects | `src/backend/storage/large_object/` |
+| Sequence internals | `src/backend/commands/sequence.c` |

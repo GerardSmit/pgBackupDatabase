@@ -10,7 +10,7 @@ public sealed class FullLogTests
     public FullLogTests(PgContainerFixture pg) => _pg = pg;
 
     [Fact]
-    public async Task FullLog_Bak_Has_No_Data_Section()
+    public async Task FullLog_Bak_Has_Logical_Stream_And_No_Data_Section()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -29,7 +29,14 @@ public sealed class FullLogTests
         var types = Helpers.ListSectionTypes(bytes);
 
         Assert.DoesNotContain(Helpers.SectionData, types);
-        Assert.Contains(Helpers.SectionWal, types);
+        Assert.Contains(Helpers.SectionLogicalStream, types);
+        Assert.DoesNotContain(Helpers.SectionWalSegments, types);
+
+        var logical = Helpers.DecodeSections(bytes)
+            .First(s => s.sectionType == Helpers.SectionLogicalStream).data;
+        var frames = Helpers.DecodeLogicalStream(logical);
+
+        Assert.Contains(frames, f => f.Contains("INSERT INTO public.t"));
     }
 
     [Fact]

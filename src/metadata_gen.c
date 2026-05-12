@@ -3,6 +3,7 @@
 
 #include "executor/spi.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 
 #include "metadata_gen.h"
 
@@ -13,6 +14,48 @@
 	"'_timescaledb_config', '_timescaledb_cache', " \
 	"'_timescaledb_functions', 'timescaledb_information', " \
 	"'timescaledb_experimental')"
+
+typedef struct SequenceStateTarget
+{
+	char	   *nspname;
+	char	   *relname;
+	char	   *query;
+} SequenceStateTarget;
+
+static bool
+looks_integer_literal(const char *s)
+{
+	const char *p;
+
+	if (s == NULL || *s == '\0')
+		return false;
+	p = s;
+	if (*p == '-')
+		p++;
+	if (*p == '\0')
+		return false;
+	for (; *p; p++)
+	{
+		if (*p < '0' || *p > '9')
+			return false;
+	}
+	return true;
+}
+
+static void
+append_timescale_interval_arg(StringInfo out, const char *value)
+{
+	if (value == NULL || value[0] == '\0')
+	{
+		appendStringInfoString(out, "NULL");
+		return;
+	}
+
+	if (looks_integer_literal(value))
+		appendStringInfoString(out, value);
+	else
+		appendStringInfo(out, "INTERVAL %s", quote_literal_cstr(value));
+}
 
 StringInfo
 metadata_gen_extensions(Oid db_oid)
@@ -55,6 +98,112 @@ metadata_gen_extensions(Oid db_oid)
 				appendStringInfo(result, " VERSION %s",
 								 quote_literal_cstr(extversion));
 			appendStringInfoString(result, ";\n");
+		}
+	}
+
+	SPI_finish();
+	return result;
+}
+
+StringInfo
+metadata_gen_roles(Oid db_oid)
+{
+	StringInfo	result = makeStringInfo();
+	Oid			argtypes[1] = {OIDOID};
+	Datum		args[1];
+	int			ret;
+
+	args[0] = ObjectIdGetDatum(db_oid);
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"WITH role_names(role_name) AS ("
+		"  SELECT pg_get_userbyid(d.datdba) "
+		"  FROM pg_database d "
+		"  WHERE d.oid = $1 "
+		"UNION "
+		"  SELECT pg_get_userbyid(n.nspowner) "
+		"  FROM pg_namespace n "
+		"  WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"UNION "
+		"  SELECT pg_get_userbyid(c.relowner) "
+		"  FROM pg_class c "
+		"  JOIN pg_namespace n ON c.relnamespace = n.oid "
+		"  WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"    AND c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p') "
+		"    AND NOT EXISTS ("
+		"      SELECT 1 FROM pg_depend d "
+		"      WHERE d.objid = c.oid AND d.deptype = 'e'"
+		"    ) "
+		"UNION "
+		"  SELECT pg_get_userbyid(a.grantee) "
+		"  FROM pg_class c "
+		"  JOIN pg_namespace n ON c.relnamespace = n.oid, "
+		"       aclexplode(c.relacl) a "
+		"  WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"    AND c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p') "
+		"    AND a.grantee <> 0 "
+		"    AND NOT EXISTS ("
+		"      SELECT 1 FROM pg_depend d "
+		"      WHERE d.objid = c.oid AND d.deptype = 'e'"
+		"    ) "
+		"UNION "
+		"  SELECT pg_get_userbyid(d.defaclrole) "
+		"  FROM pg_default_acl d "
+		"UNION "
+		"  SELECT pg_get_userbyid(a.grantee) "
+		"  FROM pg_default_acl d, aclexplode(d.defaclacl) a "
+		"  WHERE a.grantee <> 0 "
+		"UNION "
+		"  SELECT pg_get_userbyid(a.grantee) "
+		"  FROM pg_database d, aclexplode(d.datacl) a "
+		"  WHERE d.oid = $1 AND a.grantee <> 0 "
+		"UNION "
+		"  SELECT pg_get_userbyid(s.setrole) "
+		"  FROM pg_db_role_setting s "
+		"  WHERE s.setdatabase = $1 AND s.setrole <> 0 "
+	"UNION "
+	"  SELECT pg_get_userbyid(role_oid) "
+	"  FROM pg_policy pol, unnest(pol.polroles) AS role_oid "
+	"  WHERE role_oid <> 0 "
+	"UNION "
+	"  SELECT pg_get_userbyid(m.lomowner) "
+	"  FROM pg_largeobject_metadata m "
+		"UNION "
+		"  SELECT pg_get_userbyid(a.grantee) "
+		"  FROM pg_largeobject_metadata m, aclexplode(m.lomacl) a "
+		"  WHERE a.grantee <> 0"
+	") "
+	"SELECT DISTINCT role_name "
+		"FROM role_names "
+		"WHERE role_name IS NOT NULL "
+		"ORDER BY role_name",
+		1, argtypes, args, NULL, true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *role = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 1);
+
+			if (role == NULL)
+				continue;
+
+			appendStringInfo(result,
+							 "DO $pg_dbbackup_role$\n"
+							 "BEGIN\n"
+							 "  IF NOT EXISTS ("
+							 "SELECT 1 FROM pg_catalog.pg_roles "
+							 "WHERE rolname = %s) THEN\n"
+							 "    RAISE WARNING 'pg_dbbackup: role \"%%\" did not exist on restore target; creating NOLOGIN placeholder role without passwords or memberships', %s;\n"
+							 "    CREATE ROLE %s NOLOGIN;\n"
+							 "  END IF;\n"
+							 "END\n"
+							 "$pg_dbbackup_role$;\n",
+							 quote_literal_cstr(role),
+							 quote_literal_cstr(role),
+							 quote_identifier(role));
 		}
 	}
 
@@ -299,6 +448,67 @@ metadata_gen_object_grants(Oid db_oid)
 }
 
 StringInfo
+metadata_gen_object_owners(Oid db_oid)
+{
+	StringInfo	result = makeStringInfo();
+	int			ret;
+
+	(void) db_oid;
+
+	SPI_connect();
+	ret = SPI_execute(
+		"SELECT n.nspname, c.relname, c.relkind, "
+		"       pg_get_userbyid(c.relowner) AS owner "
+		"FROM pg_class c "
+		"JOIN pg_namespace n ON c.relnamespace = n.oid "
+		"WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"  AND c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p') "
+		"  AND NOT EXISTS ("
+		"    SELECT 1 FROM pg_depend d "
+		"    WHERE d.objid = c.oid AND d.deptype = 'e'"
+		"  ) "
+		"ORDER BY n.nspname, c.relname",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *relname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+			char	   *relkind = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 3);
+			char	   *owner = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 4);
+			const char *kind_label = "TABLE";
+
+			if (nspname == NULL || relname == NULL ||
+				relkind == NULL || owner == NULL)
+				continue;
+
+			switch (relkind[0])
+			{
+				case 'S': kind_label = "SEQUENCE"; break;
+				case 'm': kind_label = "MATERIALIZED VIEW"; break;
+				default: kind_label = "TABLE"; break;
+			}
+
+			appendStringInfo(result,
+							 "ALTER %s %s.%s OWNER TO %s;\n",
+							 kind_label,
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 quote_identifier(owner));
+		}
+	}
+
+	SPI_finish();
+	return result;
+}
+
+StringInfo
 metadata_gen_comments(Oid db_oid)
 {
 	StringInfo	result = makeStringInfo();
@@ -414,6 +624,148 @@ metadata_gen_db_settings(Oid db_oid)
 	return result;
 }
 
+static void
+append_timescaledb_policies(StringInfo result)
+{
+	int			ret;
+
+	ret = SPI_execute(
+		"SELECT 1 FROM pg_class c "
+		"JOIN pg_namespace n ON c.relnamespace = n.oid "
+		"WHERE n.nspname = '_timescaledb_config' "
+		"  AND c.relname = 'bgw_job'",
+		true, 0);
+	if (ret != SPI_OK_SELECT || SPI_processed == 0)
+		return;
+
+	ret = SPI_execute(
+		"SELECT j.proc_name::text, j.schedule_interval::text, "
+		"       h.schema_name, h.table_name, "
+		"       ca.user_view_schema, ca.user_view_name, "
+		"       j.config->>'drop_after', "
+		"       j.config->>'compress_after', "
+		"       j.config->>'start_offset', "
+		"       j.config->>'end_offset' "
+		"FROM _timescaledb_config.bgw_job j "
+		"LEFT JOIN _timescaledb_catalog.hypertable h "
+		"  ON h.id = j.hypertable_id "
+		"LEFT JOIN _timescaledb_catalog.continuous_agg ca "
+		"  ON ca.mat_hypertable_id = j.hypertable_id "
+		"WHERE j.proc_name IN ("
+		"  'policy_retention', "
+		"  'policy_compression', "
+		"  'policy_refresh_continuous_aggregate') "
+		"ORDER BY j.id",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		uint64		i;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			char	   *proc = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 1);
+			char	   *schedule = SPI_getvalue(SPI_tuptable->vals[i],
+												SPI_tuptable->tupdesc, 2);
+			char	   *schema = SPI_getvalue(SPI_tuptable->vals[i],
+											  SPI_tuptable->tupdesc, 3);
+			char	   *table = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 4);
+			char	   *view_schema = SPI_getvalue(SPI_tuptable->vals[i],
+												   SPI_tuptable->tupdesc, 5);
+			char	   *view_name = SPI_getvalue(SPI_tuptable->vals[i],
+												 SPI_tuptable->tupdesc, 6);
+			char	   *drop_after = SPI_getvalue(SPI_tuptable->vals[i],
+												  SPI_tuptable->tupdesc, 7);
+			char	   *compress_after = SPI_getvalue(SPI_tuptable->vals[i],
+													  SPI_tuptable->tupdesc, 8);
+			char	   *start_offset = SPI_getvalue(SPI_tuptable->vals[i],
+													SPI_tuptable->tupdesc, 9);
+			char	   *end_offset = SPI_getvalue(SPI_tuptable->vals[i],
+												  SPI_tuptable->tupdesc, 10);
+			StringInfoData qualified;
+
+			if (proc == NULL)
+				continue;
+
+			initStringInfo(&qualified);
+			if (strcmp(proc, "policy_refresh_continuous_aggregate") == 0)
+			{
+				if (view_schema == NULL || view_name == NULL)
+				{
+					pfree(qualified.data);
+					continue;
+				}
+				appendStringInfo(&qualified, "%s.%s",
+								 quote_identifier(view_schema),
+								 quote_identifier(view_name));
+				appendStringInfo(result,
+								 "SELECT public.add_continuous_aggregate_policy("
+								 "%s, start_offset => ",
+								 quote_literal_cstr(qualified.data));
+				append_timescale_interval_arg(result, start_offset);
+				appendStringInfoString(result, ", end_offset => ");
+				append_timescale_interval_arg(result, end_offset);
+				if (schedule != NULL)
+				{
+					appendStringInfo(result,
+									 ", schedule_interval => INTERVAL %s",
+									 quote_literal_cstr(schedule));
+				}
+				appendStringInfoString(result,
+									   ", if_not_exists => true);\n");
+			}
+			else
+			{
+				if (schema == NULL || table == NULL)
+				{
+					pfree(qualified.data);
+					continue;
+				}
+				appendStringInfo(&qualified, "%s.%s",
+								 quote_identifier(schema),
+								 quote_identifier(table));
+
+				if (strcmp(proc, "policy_retention") == 0)
+				{
+					appendStringInfo(result,
+									 "SELECT public.add_retention_policy("
+									 "%s, drop_after => ",
+									 quote_literal_cstr(qualified.data));
+					append_timescale_interval_arg(result, drop_after);
+					if (schedule != NULL)
+					{
+						appendStringInfo(result,
+										 ", schedule_interval => INTERVAL %s",
+										 quote_literal_cstr(schedule));
+					}
+					appendStringInfoString(result,
+										   ", if_not_exists => true);\n");
+				}
+				else if (strcmp(proc, "policy_compression") == 0)
+				{
+					appendStringInfo(result,
+									 "SELECT public.add_compression_policy("
+									 "%s, compress_after => ",
+									 quote_literal_cstr(qualified.data));
+					append_timescale_interval_arg(result, compress_after);
+					if (schedule != NULL)
+					{
+						appendStringInfo(result,
+										 ", schedule_interval => INTERVAL %s",
+										 quote_literal_cstr(schedule));
+					}
+					appendStringInfoString(result,
+										   ", if_not_exists => true);\n");
+				}
+			}
+
+			pfree(qualified.data);
+		}
+	}
+}
+
 /*
  * Detect TimescaleDB objects in the source DB and emit the SQL needed
  * to reconstruct them on the restore target after the plain user-table
@@ -458,7 +810,8 @@ metadata_gen_timescaledb(Oid db_oid)
 
 	/* hypertables + time dimension */
 	ret = SPI_execute(
-		"SELECT h.schema_name, h.table_name, d.column_name, d.column_type, "
+		"SELECT DISTINCT ON (h.id) "
+		"       h.schema_name, h.table_name, d.column_name, d.column_type, "
 		"       d.interval_length "
 		"FROM _timescaledb_catalog.hypertable h "
 		"JOIN _timescaledb_catalog.dimension d ON d.hypertable_id = h.id "
@@ -525,6 +878,107 @@ metadata_gen_timescaledb(Oid db_oid)
 
 			pfree(qualified.data);
 			pfree(chunk_arg.data);
+		}
+	}
+
+	/* additional range/hash dimensions */
+	ret = SPI_execute(
+		"WITH first_dim AS ("
+		"  SELECT hypertable_id, min(id) AS first_id "
+		"  FROM _timescaledb_catalog.dimension "
+		"  GROUP BY hypertable_id"
+		") "
+		"SELECT h.schema_name, h.table_name, d.column_name, d.column_type, "
+		"       d.interval_length, d.num_slices "
+		"FROM _timescaledb_catalog.hypertable h "
+		"JOIN first_dim f ON f.hypertable_id = h.id "
+		"JOIN _timescaledb_catalog.dimension d "
+		"  ON d.hypertable_id = h.id AND d.id <> f.first_id "
+		"WHERE h.schema_name NOT IN ('_timescaledb_internal', "
+		"                            '_timescaledb_catalog') "
+		"  AND NOT EXISTS ("
+		"    SELECT 1 FROM _timescaledb_catalog.continuous_agg ca "
+		"    WHERE ca.mat_hypertable_id = h.id"
+		"  ) "
+		"ORDER BY h.id, d.id",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		uint64		i;
+
+		for (i = 0; i < SPI_processed; i++)
+		{
+			char	   *schema = SPI_getvalue(SPI_tuptable->vals[i],
+											  SPI_tuptable->tupdesc, 1);
+			char	   *table = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 2);
+			char	   *colname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 3);
+			char	   *coltype = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 4);
+			char	   *ivl = SPI_getvalue(SPI_tuptable->vals[i],
+										   SPI_tuptable->tupdesc, 5);
+			char	   *slices = SPI_getvalue(SPI_tuptable->vals[i],
+											  SPI_tuptable->tupdesc, 6);
+			StringInfoData qualified;
+
+			if (schema == NULL || table == NULL || colname == NULL)
+				continue;
+
+			initStringInfo(&qualified);
+			appendStringInfo(&qualified, "%s.%s",
+							 quote_identifier(schema),
+							 quote_identifier(table));
+
+			if (ivl != NULL)
+			{
+				StringInfoData chunk_arg;
+
+				initStringInfo(&chunk_arg);
+				if (coltype != NULL &&
+					(strstr(coltype, "timestamp") != NULL ||
+					 strstr(coltype, "date") != NULL))
+				{
+					appendStringInfo(&chunk_arg,
+									 "interval '%s microseconds'", ivl);
+				}
+				else
+				{
+					appendStringInfoString(&chunk_arg, ivl);
+				}
+
+				appendStringInfo(result,
+								 "SELECT public.add_dimension("
+								 "%s, public.by_range(%s, %s), "
+								 "if_not_exists => true);\n",
+								 quote_literal_cstr(qualified.data),
+								 quote_literal_cstr(colname),
+								 chunk_arg.data);
+				pfree(chunk_arg.data);
+			}
+			else if (slices != NULL)
+			{
+				appendStringInfo(result,
+								 "SELECT public.add_dimension("
+								 "%s, public.by_hash(%s, %s), "
+								 "if_not_exists => true);\n",
+								 quote_literal_cstr(qualified.data),
+								 quote_literal_cstr(colname),
+								 slices);
+			}
+			else
+			{
+				SPI_finish();
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("unsupported TimescaleDB dimension on %s",
+								qualified.data),
+						 errdetail("Dimension column \"%s\" has neither interval_length nor num_slices.",
+								   colname)));
+			}
+
+			pfree(qualified.data);
 		}
 	}
 
@@ -733,7 +1187,277 @@ metadata_gen_timescaledb(Oid db_oid)
 		}
 	}
 
+	append_timescaledb_policies(result);
+
 	SPI_finish();
+	return result;
+}
+
+StringInfo
+metadata_gen_sequence_values(Oid db_oid)
+{
+	StringInfo	result = makeStringInfo();
+	SequenceStateTarget *targets = NULL;
+	MemoryContext caller_ctx = CurrentMemoryContext;
+	uint64		target_count = 0;
+	int			ret;
+
+	(void) db_oid;
+
+	SPI_connect();
+	ret = SPI_execute(
+		"SELECT n.nspname, c.relname "
+		"FROM pg_class c "
+		"JOIN pg_namespace n ON c.relnamespace = n.oid "
+		"WHERE c.relkind = 'S' "
+		"  AND " SKIP_SYSTEM_NSP_SQL " "
+		"  AND NOT EXISTS ("
+		"    SELECT 1 FROM pg_depend d "
+		"    WHERE d.objid = c.oid AND d.deptype = 'e'"
+		"  ) "
+		"ORDER BY n.nspname, c.relname",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT && SPI_processed > 0)
+	{
+		MemoryContext oldctx;
+
+		target_count = SPI_processed;
+		oldctx = MemoryContextSwitchTo(caller_ctx);
+		targets = palloc0(sizeof(SequenceStateTarget) * target_count);
+
+		for (uint64 i = 0; i < target_count; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *relname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+
+			if (nspname == NULL || relname == NULL)
+				continue;
+
+			targets[i].nspname = pstrdup(nspname);
+			targets[i].relname = pstrdup(relname);
+			targets[i].query = psprintf(
+				"SELECT last_value::text, is_called::text FROM %s.%s",
+				quote_identifier(nspname),
+				quote_identifier(relname));
+		}
+		MemoryContextSwitchTo(oldctx);
+	}
+	SPI_finish();
+
+	if (targets == NULL)
+		return result;
+
+	SPI_connect();
+	for (uint64 i = 0; i < target_count; i++)
+	{
+		char	   *last_value;
+		char	   *is_called;
+		char	   *qualified;
+
+		if (targets[i].query == NULL)
+			continue;
+
+		ret = SPI_execute(targets[i].query, true, 1);
+		if (ret != SPI_OK_SELECT || SPI_processed != 1)
+			continue;
+
+		last_value = SPI_getvalue(SPI_tuptable->vals[0],
+								  SPI_tuptable->tupdesc, 1);
+		is_called = SPI_getvalue(SPI_tuptable->vals[0],
+								  SPI_tuptable->tupdesc, 2);
+		if (last_value == NULL || is_called == NULL)
+			continue;
+
+		qualified = quote_qualified_identifier(targets[i].nspname,
+											   targets[i].relname);
+		appendStringInfo(result,
+						 "SELECT pg_catalog.setval(%s::regclass, %s, %s);\n",
+						 quote_literal_cstr(qualified),
+						 last_value,
+						 (is_called[0] == 't') ? "true" : "false");
+	}
+	SPI_finish();
+
+	return result;
+}
+
+StringInfo
+metadata_gen_large_objects(Oid db_oid)
+{
+	StringInfo	result = makeStringInfo();
+	StringInfoData oid_array;
+	int			ret;
+
+	(void) db_oid;
+
+	initStringInfo(&oid_array);
+	appendStringInfoString(&oid_array, "ARRAY[");
+
+	SPI_connect();
+	ret = SPI_execute(
+		"SELECT oid::text, pg_get_userbyid(lomowner) AS owner "
+		"FROM pg_largeobject_metadata "
+		"ORDER BY oid",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *loid = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 1);
+			char	   *owner = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 2);
+
+			if (loid == NULL)
+				continue;
+
+			if (i > 0)
+				appendStringInfoString(&oid_array, ", ");
+			appendStringInfo(&oid_array, "%s::oid", loid);
+
+			appendStringInfo(result,
+							 "DO $pg_dbbackup_lo$\n"
+							 "BEGIN\n"
+							 "  IF EXISTS (SELECT 1 FROM pg_catalog.pg_largeobject_metadata WHERE oid = %s::oid) THEN\n"
+							 "    PERFORM pg_catalog.lo_unlink(%s::oid);\n"
+							 "  END IF;\n"
+							 "  PERFORM pg_catalog.lo_create(%s::oid);\n"
+							 "END\n"
+							 "$pg_dbbackup_lo$;\n",
+							 loid, loid, loid);
+			if (owner != NULL)
+				appendStringInfo(result,
+								 "ALTER LARGE OBJECT %s OWNER TO %s;\n",
+								 loid, quote_identifier(owner));
+		}
+	}
+	SPI_finish();
+
+	appendStringInfoString(&oid_array, "]::oid[]");
+
+	appendStringInfo(result,
+					 "DO $pg_dbbackup_lo_reconcile$\n"
+					 "DECLARE r oid;\n"
+					 "BEGIN\n"
+					 "  FOR r IN SELECT oid FROM pg_catalog.pg_largeobject_metadata LOOP\n"
+					 "    IF NOT (r = ANY(%s)) THEN\n"
+					 "      PERFORM pg_catalog.lo_unlink(r);\n"
+					 "    END IF;\n"
+					 "  END LOOP;\n"
+					 "END\n"
+					 "$pg_dbbackup_lo_reconcile$;\n",
+					 oid_array.data);
+	pfree(oid_array.data);
+
+	SPI_connect();
+	ret = SPI_execute(
+		"SELECT loid::text, pageno::text, encode(data, 'hex') "
+		"FROM pg_largeobject "
+		"ORDER BY loid, pageno",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *loid = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 1);
+			char	   *pageno = SPI_getvalue(SPI_tuptable->vals[i],
+											  SPI_tuptable->tupdesc, 2);
+			char	   *hex = SPI_getvalue(SPI_tuptable->vals[i],
+										   SPI_tuptable->tupdesc, 3);
+
+			if (loid == NULL || pageno == NULL || hex == NULL)
+				continue;
+
+			appendStringInfo(result,
+							 "SELECT pg_catalog.lo_put(%s::oid, (%s::bigint * 2048), decode(%s, 'hex'));\n",
+							 loid, pageno, quote_literal_cstr(hex));
+		}
+	}
+	SPI_finish();
+
+	SPI_connect();
+	ret = SPI_execute(
+		"SELECT m.oid::text, pg_get_userbyid(a.grantee) AS grantee, "
+		"       a.privilege_type, a.is_grantable "
+		"FROM pg_largeobject_metadata m, aclexplode(m.lomacl) a "
+		"WHERE a.grantee <> 0 "
+		"ORDER BY m.oid, a.grantee, a.privilege_type",
+		true, 0);
+
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *loid = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 1);
+			char	   *grantee = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+			char	   *priv = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 3);
+			char	   *grantable = SPI_getvalue(SPI_tuptable->vals[i],
+												 SPI_tuptable->tupdesc, 4);
+
+			if (loid == NULL || grantee == NULL || priv == NULL)
+				continue;
+
+			appendStringInfo(result,
+							 "GRANT %s ON LARGE OBJECT %s TO %s%s;\n",
+							 priv,
+							 loid,
+							 quote_identifier(grantee),
+							 (grantable && strcmp(grantable, "t") == 0)
+								 ? " WITH GRANT OPTION" : "");
+		}
+	}
+	SPI_finish();
+
+	return result;
+}
+
+StringInfo
+metadata_gen_log_tail(Oid db_oid)
+{
+	StringInfo	result = makeStringInfo();
+	StringInfo	part;
+
+	appendStringInfoString(result, "-- === Extensions ===\n");
+	part = metadata_gen_extensions(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Referenced roles ===\n");
+	part = metadata_gen_roles(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === TimescaleDB hypertables ===\n");
+	part = metadata_gen_timescaledb(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Object owners ===\n");
+	part = metadata_gen_object_owners(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Object grants ===\n");
+	part = metadata_gen_object_grants(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Comments ===\n");
+	part = metadata_gen_comments(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Large objects ===\n");
+	part = metadata_gen_large_objects(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
+	appendStringInfoString(result, "-- === Sequence values ===\n");
+	part = metadata_gen_sequence_values(db_oid);
+	appendBinaryStringInfo(result, part->data, part->len);
+
 	return result;
 }
 
@@ -745,6 +1469,10 @@ metadata_gen_all(Oid db_oid)
 
 	appendStringInfoString(buf, "-- === Extensions ===\n");
 	part = metadata_gen_extensions(db_oid);
+	appendBinaryStringInfo(buf, part->data, part->len);
+
+	appendStringInfoString(buf, "-- === Referenced roles ===\n");
+	part = metadata_gen_roles(db_oid);
 	appendBinaryStringInfo(buf, part->data, part->len);
 
 	appendStringInfoString(buf, "-- === Schemas ===\n");
@@ -759,6 +1487,14 @@ metadata_gen_all(Oid db_oid)
 	part = metadata_gen_default_acls(db_oid);
 	appendBinaryStringInfo(buf, part->data, part->len);
 
+	appendStringInfoString(buf, "-- === TimescaleDB hypertables ===\n");
+	part = metadata_gen_timescaledb(db_oid);
+	appendBinaryStringInfo(buf, part->data, part->len);
+
+	appendStringInfoString(buf, "-- === Object owners ===\n");
+	part = metadata_gen_object_owners(db_oid);
+	appendBinaryStringInfo(buf, part->data, part->len);
+
 	appendStringInfoString(buf, "-- === Object grants ===\n");
 	part = metadata_gen_object_grants(db_oid);
 	appendBinaryStringInfo(buf, part->data, part->len);
@@ -771,8 +1507,12 @@ metadata_gen_all(Oid db_oid)
 	part = metadata_gen_db_settings(db_oid);
 	appendBinaryStringInfo(buf, part->data, part->len);
 
-	appendStringInfoString(buf, "-- === TimescaleDB hypertables ===\n");
-	part = metadata_gen_timescaledb(db_oid);
+	appendStringInfoString(buf, "-- === Large objects ===\n");
+	part = metadata_gen_large_objects(db_oid);
+	appendBinaryStringInfo(buf, part->data, part->len);
+
+	appendStringInfoString(buf, "-- === Sequence values ===\n");
+	part = metadata_gen_sequence_values(db_oid);
 	appendBinaryStringInfo(buf, part->data, part->len);
 
 	return buf;

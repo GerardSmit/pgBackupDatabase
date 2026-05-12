@@ -25,14 +25,18 @@ public sealed class PgWithExtensionsFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
+        var pgMajor = await CachedPgDbBackupImage.DetectPgMajorAsync(Image);
+        var image = await CachedPgDbBackupImage.BuildAsync(Image, pgMajor);
+
         _container = new PostgreSqlBuilder()
-            .WithImage(Image)
+            .WithImage(image)
             .WithUsername(User)
             .WithPassword(Password)
             .WithDatabase(Db)
             .WithCommand(
-                "-c", "shared_preload_libraries=timescaledb,pg_textsearch",
-                "-c", "wal_level=replica",
+                "-c", "shared_preload_libraries=timescaledb,pg_textsearch,pg_dbbackup",
+                "-c", "wal_level=logical",
+                "-c", "max_replication_slots=100",
                 "-c", "track_commit_timestamp=on",
                 "-c", "max_wal_senders=5",
                 "-c", "wal_keep_size=64",
@@ -46,10 +50,6 @@ public sealed class PgWithExtensionsFixture : IAsyncLifetime
         await _container.StartAsync();
         await WaitForReadyConnectionAsync();
         await DetectExtensionsAsync();
-        await InstallBuildDepsAsync();
-        await CopySourceAsync();
-        await BuildAndInstallAsync();
-        await CopyExtensionMetadataAsync();
         await EnsureExtensionInPostgresDbAsync();
     }
 
@@ -304,6 +304,12 @@ public sealed class PgWithExtensionsFixture : IAsyncLifetime
         var raw = await _container.ExecAsync(new[] { "sh", "-c", command });
         return new PgContainerFixture.ExecResult(
             raw.ExitCode, raw.Stdout ?? string.Empty, raw.Stderr ?? string.Empty);
+    }
+
+    public async Task<string> LogsAsync()
+    {
+        var (stdout, stderr) = await _container.GetLogsAsync();
+        return $"--- STDOUT ---\n{stdout}\n--- STDERR ---\n{stderr}";
     }
 
     private async Task<PgContainerFixture.ExecResult> ShellOrThrowAsync(

@@ -1,20 +1,12 @@
 #include "postgres.h"
 
 #include <libpq-fe.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <dirent.h>
 
-#include "access/xlog.h"
-#include "common/relpath.h"
+#include "common/cryptohash.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "port.h"
-#include "postmaster/bgwriter.h"
-#include "storage/block.h"
-#include "storage/bufmgr.h"
-#include "storage/bufpage.h"
-#include "storage/fd.h"
+#include "port/pg_bswap.h"
 #include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/wait_event.h"
@@ -22,345 +14,319 @@
 #include "bakfile.h"
 #include "libpq_helpers.h"
 #include "restore_full.h"
-#include "subprocess_recovery.h"
-#include "wal_replay.h"
 
-/*
- * CHECKPOINT_FAST was renamed from CHECKPOINT_IMMEDIATE in PG18; provide
- * an alias so this compiles against both PG17 and PG18.
- */
-#ifndef CHECKPOINT_FAST
-#define CHECKPOINT_FAST CHECKPOINT_IMMEDIATE
-#endif
+#define RESTORE_COPY_CHUNK_SIZE (1024 * 1024)
 
-static Oid
-libpq_query_db_oid(PGconn *conn, const char *dbname)
+static char *
+libpq_copy_column_list(PGconn *conn, const char *schema,
+					   const char *relname, const char *path)
 {
-	const char *params[1] = {dbname};
+	const char *params[2];
 	PGresult   *res;
-	Oid			oid;
-	char	   *val;
+	ExecStatusType st;
+	char	   *cols;
 
+	params[0] = schema;
+	params[1] = relname;
 	res = PQexecParams(conn,
-					   "SELECT oid::text FROM pg_database WHERE datname = $1",
-					   1, NULL, params, NULL, NULL, 0);
-	if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK ||
-		PQntuples(res) != 1)
+					   "SELECT string_agg(quote_ident(a.attname), ', ' "
+					   "                  ORDER BY a.attnum) "
+					   "FROM pg_class c "
+					   "JOIN pg_namespace n ON c.relnamespace = n.oid "
+					   "JOIN pg_attribute a ON a.attrelid = c.oid "
+					   "WHERE n.nspname = $1 "
+					   "  AND c.relname = $2 "
+					   "  AND a.attnum > 0 "
+					   "  AND NOT a.attisdropped "
+					   "  AND a.attgenerated = ''",
+					   2, NULL, params, NULL, NULL, 0);
+	st = PQresultStatus(res);
+	if (st != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
 	{
-		char	   *msg = res ? pstrdup(PQerrorMessage(conn)) : pstrdup("no result");
+		char	   *msg = pstrdup(PQerrorMessage(conn));
 
-		if (res)
-			PQclear(res);
+		PQclear(res);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not look up oid of \"%s\"", dbname),
+				 errmsg("could not enumerate restore columns for \"%s\"",
+						path),
 				 errdetail("%s", msg)));
 	}
 
-	val = PQgetvalue(res, 0, 0);
-	oid = (Oid) strtoul(val, NULL, 10);
+	cols = pstrdup(PQgetvalue(res, 0, 0));
 	PQclear(res);
-	return oid;
+	return cols;
 }
 
 static void
-terminate_db_connections(PGconn *admin, Oid db_oid)
+logical_libpq_copy_in_from_reader(PGconn *conn, BakFileReader *reader,
+								  BakDataEntry *entry)
 {
-	StringInfoData sql;
+	StringInfoData copy_sql;
+	PGresult   *res;
+	ExecStatusType st;
+	const char *dot;
+	char	   *schema;
+	char	   *relname;
+	char	   *cols;
+	char	   *buf;
+	uint64		remaining;
+	pg_cryptohash_ctx *ctx;
+	uint8		computed[32];
+	int			r;
 
-	initStringInfo(&sql);
-	appendStringInfo(&sql,
-					 "SELECT pg_terminate_backend(pid) "
-					 "FROM pg_stat_activity "
-					 "WHERE datid = %u AND pid <> pg_backend_pid()",
-					 db_oid);
-	pgbu_libpq_exec(admin, sql.data, "terminate temp DB connections");
-	pfree(sql.data);
-}
-
-static void
-clear_db_dir(const char *dirpath)
-{
-	DIR		   *dir;
-	struct dirent *de;
-
-	dir = AllocateDir(dirpath);
-	if (dir == NULL)
-		return;
-
-	while ((de = ReadDir(dir, dirpath)) != NULL)
-	{
-		char	   *fullpath;
-
-		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
-			continue;
-
-		fullpath = psprintf("%s/%s", dirpath, de->d_name);
-		(void) unlink(fullpath);
-		pfree(fullpath);
-	}
-
-	FreeDir(dir);
-}
-
-/*
- * Try to interpret a DATA entry path as a block-level entry of the form
- * "base/<src_dboid>/<relnode>:<fork>:<blockno>". On match, overlay the 8KB
- * page onto the correct segment file of base/<temp_dboid>/ and return true.
- * On non-match, return false so the caller falls back to whole-file injection.
- */
-static bool
-inject_block_entry(const char *relpath_src, Oid src_dboid, Oid temp_dboid,
-					const char *data, size_t data_len)
-{
-	char		src_prefix[64];
-	const char *tail;
-	const char *colon1;
-	const char *colon2;
-	char		relnode_buf[32];
-	char		fork_buf[32];
-	char		block_buf[32];
-	Oid			relnode;
-	int			forknum = MAIN_FORKNUM;
-	uint64		blockno;
-	uint32		segno;
-	uint32		segoff;
-	off_t		seg_offset;
-	char		seg_relpath[MAXPGPATH];
-	char		seg_abspath[MAXPGPATH];
-	FILE	   *fp;
-
-	snprintf(src_prefix, sizeof(src_prefix), "base/%u/", src_dboid);
-	if (strncmp(relpath_src, src_prefix, strlen(src_prefix)) != 0)
-		return false;
-
-	tail = relpath_src + strlen(src_prefix);
-
-	colon1 = strchr(tail, ':');
-	if (colon1 == NULL)
-		return false;
-	colon2 = strchr(colon1 + 1, ':');
-	if (colon2 == NULL)
-		return false;
-
-	if ((size_t) (colon1 - tail) >= sizeof(relnode_buf))
-		return false;
-	memcpy(relnode_buf, tail, colon1 - tail);
-	relnode_buf[colon1 - tail] = '\0';
-
-	if ((size_t) (colon2 - colon1 - 1) >= sizeof(fork_buf))
-		return false;
-	memcpy(fork_buf, colon1 + 1, colon2 - colon1 - 1);
-	fork_buf[colon2 - colon1 - 1] = '\0';
-
-	if (strlen(colon2 + 1) >= sizeof(block_buf))
-		return false;
-	strcpy(block_buf, colon2 + 1);
-
-	relnode = (Oid) strtoul(relnode_buf, NULL, 10);
-	blockno = strtoull(block_buf, NULL, 10);
-
-	if (strcmp(fork_buf, "main") == 0)
-		forknum = MAIN_FORKNUM;
-	else if (strcmp(fork_buf, "fsm") == 0)
-		forknum = FSM_FORKNUM;
-	else if (strcmp(fork_buf, "vm") == 0)
-		forknum = VISIBILITYMAP_FORKNUM;
-	else if (strcmp(fork_buf, "init") == 0)
-		forknum = INIT_FORKNUM;
-	else
-		return false;
-
-	if (data_len != BLCKSZ)
+	dot = strchr(entry->path, '.');
+	if (dot == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("block-level DATA entry \"%s\" has size %zu (expected %u)",
-						relpath_src, data_len, (unsigned) BLCKSZ)));
+				 errmsg("data entry path missing schema separator: \"%s\"",
+						entry->path)));
+	schema = pnstrdup(entry->path, dot - entry->path);
+	relname = pstrdup(dot + 1);
+	cols = libpq_copy_column_list(conn, schema, relname, entry->path);
 
-	segno = (uint32) (blockno / RELSEG_SIZE);
-	segoff = (uint32) (blockno % RELSEG_SIZE);
-	seg_offset = (off_t) segoff * BLCKSZ;
+	initStringInfo(&copy_sql);
+	appendStringInfo(&copy_sql,
+					 "COPY %s.%s (%s) FROM STDIN (FORMAT binary)",
+					 pgbu_quote_db_identifier(schema),
+					 pgbu_quote_db_identifier(relname),
+					 cols);
+	pfree(cols);
 
-	if (forknum == MAIN_FORKNUM)
+	res = PQexec(conn, copy_sql.data);
+	st = PQresultStatus(res);
+	if (st != PGRES_COPY_IN)
 	{
-		if (segno == 0)
-			snprintf(seg_relpath, sizeof(seg_relpath), "base/%u/%u",
-					 temp_dboid, relnode);
-		else
-			snprintf(seg_relpath, sizeof(seg_relpath), "base/%u/%u.%u",
-					 temp_dboid, relnode, segno);
+		char	   *msg = pstrdup(PQerrorMessage(conn));
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("COPY FROM STDIN setup failed for \"%s\"", entry->path),
+				 errdetail("%s", msg)));
 	}
-	else
-	{
-		if (segno == 0)
-			snprintf(seg_relpath, sizeof(seg_relpath), "base/%u/%u_%s",
-					 temp_dboid, relnode, fork_buf);
-		else
-			snprintf(seg_relpath, sizeof(seg_relpath), "base/%u/%u_%s.%u",
-					 temp_dboid, relnode, fork_buf, segno);
-	}
+	PQclear(res);
 
-	snprintf(seg_abspath, sizeof(seg_abspath), "%s/%s", DataDir, seg_relpath);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not initialize SHA-256 context")));
 
-	fp = AllocateFile(seg_abspath, "r+b");
-	if (fp == NULL)
+	buf = palloc(RESTORE_COPY_CHUNK_SIZE);
+	remaining = entry->data_len;
+	while (remaining > 0)
 	{
-		/*
-		 * Target segment doesn't exist yet — the relation may have grown
-		 * after the FULL was taken. Create it and pre-extend with zeros up
-		 * to the target offset so the block lands at the correct LBN.
-		 */
-		fp = AllocateFile(seg_abspath, "w+b");
-		if (fp == NULL)
+		size_t		chunk = (remaining > RESTORE_COPY_CHUNK_SIZE) ?
+			RESTORE_COPY_CHUNK_SIZE : (size_t) remaining;
+
+		CHECK_FOR_INTERRUPTS();
+		bakfile_read_data_entry_chunk(reader, buf, chunk);
+		if (pg_cryptohash_update(ctx, buf, chunk) < 0)
 			ereport(ERROR,
-					(errcode_for_file_access(),
-					 errmsg("could not open temp DB block file \"%s\": %m",
-							seg_abspath)));
-	}
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not update SHA-256 context")));
 
-	if (fseeko(fp, seg_offset, SEEK_SET) != 0)
+		r = PQputCopyData(conn, buf, (int) chunk);
+		if (r != 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("PQputCopyData failed for \"%s\": %s",
+							entry->path, PQerrorMessage(conn))));
+		remaining -= chunk;
+	}
+	pfree(buf);
+
+	if (pg_cryptohash_final(ctx, computed, sizeof(computed)) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not finalize SHA-256 context")));
+	pg_cryptohash_free(ctx);
+
+	r = PQputCopyEnd(conn, NULL);
+	if (r != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("PQputCopyEnd failed for \"%s\": %s",
+						entry->path, PQerrorMessage(conn))));
+
+	for (;;)
 	{
-		FreeFile(fp);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not seek to offset " INT64_FORMAT " in \"%s\": %m",
-						(int64) seg_offset, seg_abspath)));
+		while (PQisBusy(conn))
+		{
+			int			sock = PQsocket(conn);
+			WaitEvent	evt;
+			WaitEventSet *wes;
+
+			CHECK_FOR_INTERRUPTS();
+
+			if (sock < 0)
+				break;
+
+			wes = CreateWaitEventSet(NULL, 2);
+			AddWaitEventToSet(wes, WL_SOCKET_READABLE, sock, NULL, NULL);
+			AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET,
+							  NULL, NULL);
+			(void) WaitEventSetWait(wes, 1000L, &evt, 1, PG_WAIT_EXTENSION);
+			FreeWaitEventSet(wes);
+
+			if (PQconsumeInput(conn) == 0)
+				break;
+		}
+
+		res = PQgetResult(conn);
+		if (res == NULL)
+			break;
+
+		st = PQresultStatus(res);
+		if (st != PGRES_COMMAND_OK)
+		{
+			char	   *msg = pstrdup(PQerrorMessage(conn));
+
+			PQclear(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("COPY FROM failed for \"%s\"", entry->path),
+					 errdetail("%s", msg)));
+		}
+		PQclear(res);
 	}
 
-	if (fwrite(data, 1, BLCKSZ, fp) != BLCKSZ)
-	{
-		int			save_errno = errno;
-
-		FreeFile(fp);
-		errno = save_errno;
+	bakfile_finish_data_entry(reader, entry, NULL, false);
+	if (memcmp(entry->checksum, computed, sizeof(computed)) != 0)
 		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write block to \"%s\": %m", seg_abspath)));
-	}
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("data entry SHA-256 mismatch for \"%s\"",
+						entry->path)));
 
-	if (fflush(fp) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not flush \"%s\": %m", seg_abspath)));
-
-	if (pg_fsync(fileno(fp)) != 0)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync \"%s\": %m", seg_abspath)));
-
-	FreeFile(fp);
-	return true;
+	pfree(copy_sql.data);
+	pfree(schema);
+	pfree(relname);
 }
-
-/*
- * Write a single relfile to DataDir/<relpath>, where relpath uses temp_dboid
- * instead of the source's dboid. Files outside `base/<src_dboid>/` are skipped
- * (no global, no tablespaces in v1).
- */
-static bool
-inject_relfile(const char *relpath_src, Oid src_dboid, Oid temp_dboid,
-				const char *data, size_t data_len)
-{
-	char		src_prefix[64];
-	char		dst_relpath[MAXPGPATH];
-	char		dst_abspath[MAXPGPATH];
-	const char *tail;
-	FILE	   *fp;
-
-	snprintf(src_prefix, sizeof(src_prefix), "base/%u/", src_dboid);
-	if (strncmp(relpath_src, src_prefix, strlen(src_prefix)) != 0)
-		return false;
-
-	tail = relpath_src + strlen(src_prefix);
-	snprintf(dst_relpath, sizeof(dst_relpath), "base/%u/%s",
-			 temp_dboid, tail);
-	snprintf(dst_abspath, sizeof(dst_abspath), "%s/%s",
-			 DataDir, dst_relpath);
-
-	fp = AllocateFile(dst_abspath, "wb");
-	if (fp == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open temp DB file \"%s\": %m",
-						dst_abspath)));
-
-	if (data_len > 0 &&
-		fwrite(data, 1, data_len, fp) != data_len)
-	{
-		int			save_errno = errno;
-
-		FreeFile(fp);
-		errno = save_errno;
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not write temp DB file \"%s\": %m",
-						dst_abspath)));
-	}
-
-	if (fflush(fp) != 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not flush temp DB file \"%s\": %m",
-						dst_abspath)));
-
-	if (pg_fsync(fileno(fp)) != 0)
-		ereport(WARNING,
-				(errcode_for_file_access(),
-				 errmsg("could not fsync \"%s\": %m", dst_abspath)));
-
-	FreeFile(fp);
-	return true;
-}
-
-typedef struct ParsedBak
-{
-	PgDbBackupType type;
-	char	   *db_name;
-	Oid			src_db_oid;
-	uint32		frozen_xid;
-	uint32		min_mxid;
-	uint64		base_backup_lsn;
-	uint64		start_lsn;
-	uint64		stop_lsn;
-	char	   *metadata_sql;
-	uint32		entry_count;
-	BakDataEntry *entries;
-	char	  **entry_data;
-	bool		has_data_section;
-	uint64		wal_section_bytes;
-} ParsedBak;
 
 static void
-load_bak(const char *filepath, const char *password, ParsedBak *out)
+restore_logical_full_data_entries(PGconn *conn, const char *filepath,
+								  const char *password,
+								  uint32 expected_entry_count)
+{
+	BakFileReader *reader;
+	uint8		stype;
+	uint32		entry_count;
+
+	reader = bakfile_open(filepath, password);
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_METADATA)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected METADATA section, got %u", stype)));
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_SCHEMA)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected SCHEMA section, got %u", stype)));
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_DATA)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected DATA section, got %u", stype)));
+
+	entry_count = bakfile_read_data_entry_count(reader);
+	if (entry_count != expected_entry_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("DATA entry count changed while restoring \"%s\"",
+						filepath)));
+
+	for (uint32 k = 0; k < entry_count; k++)
+	{
+		BakDataEntry entry;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!bakfile_next_data_entry(reader, &entry))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("DATA section ended early at entry %u of %u",
+							k, entry_count)));
+
+		ereport(NOTICE,
+				(errmsg("restoring table %u/%u: %s",
+						k + 1, entry_count, entry.path)));
+		logical_libpq_copy_in_from_reader(conn, reader, &entry);
+		pfree(entry.path);
+	}
+
+	bakfile_close_reader(reader);
+}
+
+typedef struct ParsedLogicalFull
+{
+	char	   *db_name;
+	Oid			db_oid;
+	uint64		stop_lsn;
+	int64		created_at;
+	char	   *metadata_sql;
+	char	   *schema_sql;
+	uint32		entry_count;
+} ParsedLogicalFull;
+
+static bool
+logical_full_backup_has_schema(const char *filepath, const char *password)
+{
+	BakFileReader *reader;
+	uint8		stype;
+	bool		has_schema;
+
+	reader = bakfile_open(filepath, password);
+	if (reader->header.mode != BACKUP_MODE_FULL ||
+		reader->header.type != BACKUP_TYPE_FULL)
+	{
+		bakfile_close_reader(reader);
+		return false;
+	}
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_METADATA)
+	{
+		bakfile_close_reader(reader);
+		return false;
+	}
+
+	stype = bakfile_next_section(reader);
+	has_schema = (stype == BAKSECTION_SCHEMA);
+	bakfile_close_reader(reader);
+	return has_schema;
+}
+
+static void
+load_logical_full_backup(const char *filepath, const char *password,
+						 ParsedLogicalFull *out)
 {
 	BakFileReader *reader;
 	uint8		stype;
 	char	   *buf;
 	size_t		buf_len;
-	uint32		i;
 
 	memset(out, 0, sizeof(*out));
 
 	reader = bakfile_open(filepath, password);
-
-	if (reader->header.mode != BACKUP_MODE_FULL)
+	if (reader->header.mode != BACKUP_MODE_FULL ||
+		reader->header.type != BACKUP_TYPE_FULL)
 	{
 		bakfile_close_reader(reader);
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("\"%s\" is not a FULL-mode backup", filepath)));
+				 errmsg("\"%s\" is not a FULL logical base backup", filepath)));
 	}
 
-	out->type = reader->header.type;
 	out->db_name = pstrdup(reader->header.db_name);
-	out->src_db_oid = reader->header.db_oid;
-	out->frozen_xid = reader->header.frozen_xid;
-	out->min_mxid = reader->header.min_mxid;
-	out->base_backup_lsn = reader->header.base_backup_lsn;
-	out->start_lsn = reader->header.start_lsn;
+	out->db_oid = reader->header.db_oid;
 	out->stop_lsn = reader->header.stop_lsn;
+	out->created_at = reader->header.created_at;
 
-	/* METADATA */
 	stype = bakfile_next_section(reader);
 	if (stype != BAKSECTION_METADATA)
 	{
@@ -372,250 +338,456 @@ load_bak(const char *filepath, const char *password, ParsedBak *out)
 	bakfile_read_section_all(reader, &buf, &buf_len);
 	out->metadata_sql = buf;
 
-	if (out->type == BACKUP_TYPE_LOG)
-	{
-		out->has_data_section = false;
-		out->entry_count = 0;
-	}
-	else
-	{
-		stype = bakfile_next_section(reader);
-		if (stype != BAKSECTION_DATA)
-		{
-			bakfile_close_reader(reader);
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("expected DATA section, got %u", stype)));
-		}
-		out->has_data_section = true;
-
-		out->entry_count = bakfile_read_data_entry_count(reader);
-
-		if (out->entry_count > 0)
-		{
-			out->entries = palloc0(sizeof(BakDataEntry) * out->entry_count);
-			out->entry_data = palloc0(sizeof(char *) * out->entry_count);
-		}
-
-		for (i = 0; i < out->entry_count; i++)
-		{
-			BakDataEntry *e = &out->entries[i];
-			char	   *data;
-
-			if (!bakfile_next_data_entry(reader, e))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("DATA section ended early at entry %u of %u",
-								i, out->entry_count)));
-
-			data = palloc(e->data_len == 0 ? 1 : (size_t) e->data_len);
-			if (e->data_len > 0)
-				bakfile_read_data_entry_chunk(reader, data,
-											   (size_t) e->data_len);
-
-			bakfile_finish_data_entry(reader, e, data, true);
-			out->entry_data[i] = data;
-		}
-	}
-
 	stype = bakfile_next_section(reader);
-	if (stype != BAKSECTION_WAL)
+	if (stype != BAKSECTION_SCHEMA)
 	{
 		bakfile_close_reader(reader);
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("expected WAL section, got %u", stype)));
+				 errmsg("expected SCHEMA section, got %u", stype)));
 	}
-	out->wal_section_bytes = bakfile_section_remaining(reader);
+	bakfile_read_section_all(reader, &buf, &buf_len);
+	out->schema_sql = buf;
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_DATA)
+	{
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected DATA section, got %u", stype)));
+	}
+
+	out->entry_count = bakfile_read_data_entry_count(reader);
 
 	bakfile_close_reader(reader);
 }
 
-static void
-validate_chain(ParsedBak *baks, int n)
+static uint32
+logical_read_u32(const char *buf, size_t buf_len, size_t *pos,
+				 const char *filepath)
 {
-	int			i;
-	int			diff_count = 0;
-	uint64		prev_stop;
+	uint32		net;
 
-	if (n < 1)
+	if (*pos + sizeof(net) > buf_len)
 		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("empty restore chain")));
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("truncated logical PITR stream in \"%s\"", filepath)));
 
-	if (baks[0].type != BACKUP_TYPE_FULL)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("first .bak in chain must be type=full")));
+	memcpy(&net, buf + *pos, sizeof(net));
+	*pos += sizeof(net);
+	return pg_ntoh32(net);
+}
 
-	prev_stop = baks[0].stop_lsn;
+static bool
+logical_apply_log_file(PGconn *conn, const char *filepath,
+					   const char *password, const char *expected_db_name,
+					   uint64 expected_prev_stop_lsn,
+					   TimestampTz stop_at, bool has_stop_at,
+					   uint64 *stop_lsn_out)
+{
+	BakFileReader *reader;
+	uint8		stype;
+	char	   *metadata_sql = NULL;
+	char	   *buf;
+	size_t		metadata_len = 0;
+	size_t		buf_len;
+	size_t		pos;
+	uint32		frame_count;
+	StringInfoData txn_sql;
+	bool		in_txn = false;
+	bool		stopped = false;
 
-	for (i = 1; i < n; i++)
+	reader = bakfile_open(filepath, password);
+	if (reader->header.mode != BACKUP_MODE_FULL ||
+		(reader->header.type != BACKUP_TYPE_LOG &&
+		 reader->header.type != BACKUP_TYPE_DIFFERENTIAL))
 	{
-		if (strcmp(baks[i].db_name, baks[0].db_name) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("chain entry %d is for db \"%s\", not \"%s\"",
-							i, baks[i].db_name, baks[0].db_name)));
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("\"%s\" is not a FULL logical stream backup", filepath)));
+	}
+	if (strcmp(reader->header.db_name, expected_db_name) != 0)
+	{
+		char	   *got = pstrdup(reader->header.db_name);
 
-		if (baks[i].type == BACKUP_TYPE_DIFFERENTIAL)
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("chain entry is for db \"%s\", not \"%s\"",
+						got, expected_db_name)));
+	}
+	if (reader->header.base_backup_lsn != expected_prev_stop_lsn)
+	{
+		uint64		got = reader->header.base_backup_lsn;
+
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("chain LSN gap in \"%s\"", filepath),
+				 errdetail("Expected base_backup_lsn " UINT64_FORMAT
+						   ", got " UINT64_FORMAT ".",
+						   expected_prev_stop_lsn, got)));
+	}
+	*stop_lsn_out = reader->header.stop_lsn;
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_METADATA)
+	{
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected METADATA section, got %u", stype)));
+	}
+	bakfile_read_section_all(reader, &metadata_sql, &metadata_len);
+
+	stype = bakfile_next_section(reader);
+	if (stype != BAKSECTION_LOGICAL_STREAM)
+	{
+		bakfile_close_reader(reader);
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("expected LOGICAL_STREAM section, got %u", stype)));
+	}
+	bakfile_read_section_all(reader, &buf, &buf_len);
+	bakfile_close_reader(reader);
+
+	pos = 0;
+	frame_count = logical_read_u32(buf, buf_len, &pos, filepath);
+	initStringInfo(&txn_sql);
+
+	for (uint32 i = 0; i < frame_count; i++)
+	{
+		uint32		len;
+		char	   *frame;
+
+		CHECK_FOR_INTERRUPTS();
+
+		len = logical_read_u32(buf, buf_len, &pos, filepath);
+		if (pos + len > buf_len)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("truncated logical PITR frame in \"%s\"", filepath)));
+
+		frame = pnstrdup(buf + pos, len);
+		pos += len;
+
+		if (strncmp(frame, "BEGIN\t", 6) == 0)
 		{
-			diff_count++;
-			if (diff_count > 1)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("chain may contain at most one DIFFERENTIAL .bak")));
-			if (i != 1)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("DIFFERENTIAL must immediately follow the FULL .bak in the chain")));
-			if (baks[i].base_backup_lsn != baks[0].stop_lsn)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("chain LSN gap: DIFF base_backup_lsn does not match FULL stop_lsn")));
-			prev_stop = baks[i].stop_lsn;
+			resetStringInfo(&txn_sql);
+			in_txn = true;
 		}
-		else if (baks[i].type == BACKUP_TYPE_LOG)
+		else if (strncmp(frame, "SQL\t", 4) == 0)
 		{
-			if (baks[i].base_backup_lsn != prev_stop)
+			if (!in_txn)
 				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						 errmsg("chain LSN gap at file %d: LOG base_backup_lsn does not match previous stop_lsn",
-								i)));
-			prev_stop = baks[i].stop_lsn;
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("logical SQL frame appeared outside a transaction in \"%s\"",
+								filepath)));
+			appendStringInfoString(&txn_sql, frame + 4);
+			appendStringInfoChar(&txn_sql, '\n');
+		}
+		else if (strcmp(frame, "NOOP") == 0)
+		{
+			/* Logical slot keepalive used to make failover slots sync-ready. */
+		}
+		else if (strncmp(frame, "COMMIT\t", 7) == 0)
+		{
+			char	   *ts = frame + 7;
+			char	   *tab = strchr(ts, '\t');
+			TimestampTz commit_time;
+
+			if (tab == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("malformed COMMIT frame in \"%s\"", filepath)));
+			*tab = '\0';
+			commit_time = (TimestampTz) strtoll(ts, NULL, 10);
+
+			if (has_stop_at && commit_time > stop_at)
+			{
+				stopped = true;
+				pfree(frame);
+				break;
+			}
+
+			if (in_txn && txn_sql.len > 0)
+			{
+				StringInfoData replay_sql;
+
+				initStringInfo(&replay_sql);
+				appendStringInfoString(&replay_sql, "BEGIN;\n");
+				appendStringInfoString(&replay_sql,
+									   "SET LOCAL session_replication_role = replica;\n"
+									   "SET LOCAL dbbackup.replaying = 'on';\n");
+				appendBinaryStringInfo(&replay_sql, txn_sql.data,
+									   txn_sql.len);
+				appendStringInfoString(&replay_sql, "COMMIT;\n");
+				pgbu_libpq_exec(conn, replay_sql.data,
+								"logical transaction replay");
+				pfree(replay_sql.data);
+			}
+			resetStringInfo(&txn_sql);
+			in_txn = false;
 		}
 		else
 		{
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("unknown logical PITR frame in \"%s\"", filepath)));
+		}
+
+		pfree(frame);
+	}
+
+	if (!stopped && metadata_len > 0)
+		pgbu_libpq_exec(conn, metadata_sql, "logical stream METADATA");
+
+	pfree(txn_sql.data);
+	pfree(metadata_sql);
+	pfree(buf);
+	return stopped;
+}
+
+static void
+validate_logical_restore_chain(char **files, int file_count,
+							   const char *password,
+							   const char *expected_db_name,
+							   uint64 full_stop_lsn)
+{
+	uint64		prev_stop_lsn = full_stop_lsn;
+	int			diff_count = 0;
+
+	for (int i = 1; i < file_count; i++)
+	{
+		BakFileReader *reader = bakfile_open(files[i], password);
+		PgDbBackupType type = reader->header.type;
+		uint64		base_backup_lsn = reader->header.base_backup_lsn;
+		uint64		stop_lsn = reader->header.stop_lsn;
+
+		if (reader->header.mode != BACKUP_MODE_FULL)
+		{
+			bakfile_close_reader(reader);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chain entry %d is not FULL mode", i)));
+		}
+
+		if (strcmp(reader->header.db_name, expected_db_name) != 0)
+		{
+			char	   *got = pstrdup(reader->header.db_name);
+
+			bakfile_close_reader(reader);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chain entry %d is for db \"%s\", not \"%s\"",
+							i, got, expected_db_name)));
+		}
+
+		if (type == BACKUP_TYPE_DIFFERENTIAL)
+		{
+			diff_count++;
+			if (diff_count > 1)
+			{
+				bakfile_close_reader(reader);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("chain may contain at most one DIFFERENTIAL .bak")));
+			}
+			if (i != 1)
+			{
+				bakfile_close_reader(reader);
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("DIFFERENTIAL must immediately follow the FULL .bak in the chain")));
+			}
+		}
+		else if (type != BACKUP_TYPE_LOG)
+		{
+			bakfile_close_reader(reader);
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("chain entry %d has unexpected type for follow-up backup",
 							i)));
 		}
+
+		if (base_backup_lsn != prev_stop_lsn)
+		{
+			bakfile_close_reader(reader);
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("chain LSN gap at file %d", i),
+					 errdetail("Expected base_backup_lsn " UINT64_FORMAT
+							   ", got " UINT64_FORMAT ".",
+							   prev_stop_lsn, base_backup_lsn)));
+		}
+
+		prev_stop_lsn = stop_lsn;
+		bakfile_close_reader(reader);
 	}
 }
 
-void
-restore_full(const char *target_db, char **files, int file_count,
-			 TimestampTz stop_at, bool has_stop_at, const char *password)
+static void
+repair_owned_sequence_state(PGconn *conn)
 {
-	ParsedBak  *baks;
-	char	   *temp_dbname;
-	Oid			temp_db_oid = InvalidOid;
-	char		temp_db_dir[MAXPGPATH];
-	int			i,
-				k;
+	const char *sql =
+		"DO $pg_dbbackup_seq$\n"
+		"DECLARE\n"
+		"  r record;\n"
+		"  max_value numeric;\n"
+		"  last_value numeric;\n"
+		"  qualified text;\n"
+		"BEGIN\n"
+		"  FOR r IN\n"
+		"    SELECT seq_ns.nspname AS seq_schema,\n"
+		"           seq.relname AS seq_name,\n"
+		"           tbl_ns.nspname AS table_schema,\n"
+		"           tbl.relname AS table_name,\n"
+		"           att.attname AS column_name\n"
+		"    FROM pg_class seq\n"
+		"    JOIN pg_namespace seq_ns ON seq_ns.oid = seq.relnamespace\n"
+		"    JOIN pg_depend dep ON dep.objid = seq.oid\n"
+		"    JOIN pg_class tbl ON tbl.oid = dep.refobjid\n"
+		"    JOIN pg_namespace tbl_ns ON tbl_ns.oid = tbl.relnamespace\n"
+		"    JOIN pg_attribute att ON att.attrelid = tbl.oid\n"
+		"                         AND att.attnum = dep.refobjsubid\n"
+		"    WHERE seq.relkind = 'S'\n"
+		"      AND dep.deptype IN ('a', 'i')\n"
+		"      AND tbl_ns.nspname NOT LIKE 'pg\\_%'\n"
+		"      AND tbl_ns.nspname NOT IN ('information_schema', 'dbbackup')\n"
+		"  LOOP\n"
+		"    EXECUTE format('SELECT max(%I)::numeric FROM %I.%I',\n"
+		"                   r.column_name, r.table_schema, r.table_name)\n"
+		"      INTO max_value;\n"
+		"    IF max_value IS NULL THEN\n"
+		"      CONTINUE;\n"
+		"    END IF;\n"
+		"    EXECUTE format('SELECT last_value::numeric FROM %I.%I',\n"
+		"                   r.seq_schema, r.seq_name)\n"
+		"      INTO last_value;\n"
+		"    IF last_value IS NULL OR max_value > last_value THEN\n"
+		"      qualified := format('%I.%I', r.seq_schema, r.seq_name);\n"
+		"      EXECUTE format('SELECT pg_catalog.setval(%L::regclass, %s, true)',\n"
+		"                     qualified, max_value::bigint);\n"
+		"    END IF;\n"
+		"  END LOOP;\n"
+		"END\n"
+		"$pg_dbbackup_seq$;";
 
-	if (!superuser())
-		ereport(ERROR,
-				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to perform restores")));
+	pgbu_libpq_exec(conn, sql, "repair owned sequence state");
+}
 
-	if (file_count < 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("at least one .bak file required")));
+static void
+prepare_logical_continuation(const char *target_db, const char *source_db,
+							 uint64 confirmed_lsn)
+{
+	PGconn	   *conn;
+	char		lsn_buf[64];
+	char	   *mode_sql;
 
-	baks = palloc0(sizeof(ParsedBak) * file_count);
-	for (i = 0; i < file_count; i++)
-		load_bak(files[i], password, &baks[i]);
+	snprintf(lsn_buf, sizeof(lsn_buf), "%X/%X",
+			 (uint32) (confirmed_lsn >> 32), (uint32) confirmed_lsn);
 
-	validate_chain(baks, file_count);
-
-	/*
-	 * Subprocess-based PITR: when stop_at is requested and we have WAL
-	 * segments captured, build a synthetic PGDATA, run archive recovery in a
-	 * private subprocess cluster to the PITR target, pg_dump the recovered
-	 * DB, then pg_restore into the live cluster. Falls back to the
-	 * file-injection path on failure (existing behavior).
-	 */
-	if (has_stop_at)
+	conn = pgbu_connect_libpq(target_db);
+	PG_TRY();
 	{
-		char	   *avail_detail = NULL;
+		pgbu_libpq_exec(conn, "CREATE EXTENSION IF NOT EXISTS pg_dbbackup",
+						"CREATE EXTENSION pg_dbbackup");
 
-		if (subprocess_recovery_available(&avail_detail))
+		mode_sql = psprintf(
+			"SELECT dbbackup.pg_dbbackup_set_mode(%s, 'full')",
+			quote_literal_cstr(target_db));
+		pgbu_libpq_exec(conn, mode_sql, "set restored DB backup mode");
+		pfree(mode_sql);
+
+		if (strcmp(target_db, source_db) == 0)
 		{
-			SubprocessRecoveryInput in;
-			SubprocessRecoveryResult *res;
+			PGresult   *res;
+			char	   *oid_text;
+			char	   *slot_name;
+			char	   *drop_sql;
+			char	   *create_sql;
+			char	   *chain_sql;
 
-			memset(&in, 0, sizeof(in));
-			in.file_count = file_count;
-			in.bak_filepaths = files;
-			in.password = password;
-			in.has_stop_at = has_stop_at;
-			in.stop_at = stop_at;
-
-			ereport(NOTICE,
-					(errmsg("attempting subprocess PITR recovery")));
-
-			res = subprocess_recover_and_dump(&in);
-			if (res->ok && res->dump_filepath != NULL)
+			res = PQexec(conn,
+						 "SELECT oid::text FROM pg_database "
+						 "WHERE datname = current_database()");
+			if (res == NULL || PQresultStatus(res) != PGRES_TUPLES_OK ||
+				PQntuples(res) != 1)
 			{
-				char	   *restore_err = NULL;
-				PGconn	   *admin;
-				char	   *create_sql;
-				char	   *drop_sql;
+				char	   *msg = res ? pstrdup(PQerrorMessage(conn)) :
+					pstrdup("no result");
 
-				ereport(NOTICE,
-						(errmsg("subprocess recovery succeeded, applying dump to target")));
-
-				admin = pgbu_connect_libpq("postgres");
-				PG_TRY();
-				{
-					drop_sql = psprintf(
-						"DROP DATABASE IF EXISTS %s WITH (FORCE)",
-						pgbu_quote_db_identifier(target_db));
-					pgbu_libpq_exec(admin, drop_sql, "DROP DATABASE target");
-					pfree(drop_sql);
-
-					create_sql = psprintf(
-						"CREATE DATABASE %s",
-						pgbu_quote_db_identifier(target_db));
-					pgbu_libpq_exec(admin, create_sql, "CREATE DATABASE target");
-					pfree(create_sql);
-				}
-				PG_CATCH();
-				{
-					PQfinish(admin);
-					subprocess_recovery_cleanup(res);
-					PG_RE_THROW();
-				}
-				PG_END_TRY();
-				PQfinish(admin);
-
-				if (!subprocess_pg_restore(res->dump_filepath, target_db,
-										   &restore_err))
-				{
-					char	   *e = restore_err ? restore_err :
-						pstrdup("pg_restore failed with no detail");
-
-					subprocess_recovery_cleanup(res);
-					ereport(ERROR,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("subprocess PITR restore failed during pg_restore"),
-							 errdetail("%s", e)));
-				}
-
-				subprocess_recovery_cleanup(res);
-				return;
+				if (res)
+					PQclear(res);
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("could not resolve restored database oid"),
+						 errdetail("%s", msg)));
 			}
-			else
-			{
-				char	   *err = res->error_detail ? res->error_detail :
-					pstrdup("(no detail)");
 
-				ereport(NOTICE,
-						(errmsg("subprocess PITR recovery not available, using file-injection path"),
-						 errdetail("%s", err)));
-				subprocess_recovery_cleanup(res);
-			}
-		}
-		else if (avail_detail != NULL)
-		{
-			ereport(NOTICE,
-					(errmsg("subprocess PITR not available: %s; using file-injection path",
-							avail_detail)));
+			oid_text = pstrdup(PQgetvalue(res, 0, 0));
+			PQclear(res);
+
+			slot_name = psprintf("_pg_dbbackup_%s", oid_text);
+			drop_sql = psprintf(
+				"SELECT pg_drop_replication_slot(%s) "
+				"WHERE EXISTS (SELECT 1 FROM pg_replication_slots "
+				"              WHERE slot_name = %s)",
+				quote_literal_cstr(slot_name),
+				quote_literal_cstr(slot_name));
+			create_sql = psprintf(
+				"SELECT pg_create_logical_replication_slot(%s, 'pg_dbbackup', false, false, true)",
+				quote_literal_cstr(slot_name));
+			chain_sql = psprintf(
+				"INSERT INTO dbbackup.logical_chains "
+				"(db_oid, db_name, slot_name, confirmed_lsn, updated_at) "
+				"VALUES ((SELECT oid FROM pg_database "
+				"         WHERE datname = current_database()), "
+				"        current_database(), %s, %s::pg_lsn, clock_timestamp()) "
+				"ON CONFLICT (db_oid) DO UPDATE SET "
+				"db_name = EXCLUDED.db_name, "
+				"slot_name = EXCLUDED.slot_name, "
+				"confirmed_lsn = EXCLUDED.confirmed_lsn, "
+				"updated_at = EXCLUDED.updated_at",
+				quote_literal_cstr(slot_name),
+				quote_literal_cstr(lsn_buf));
+
+			pgbu_libpq_exec(conn, drop_sql, "drop stale continuation slot");
+			pgbu_libpq_exec(conn, create_sql, "create continuation slot");
+			pgbu_libpq_exec(conn, chain_sql, "record continuation chain");
+
+			pfree(chain_sql);
+			pfree(create_sql);
+			pfree(drop_sql);
+			pfree(slot_name);
+			pfree(oid_text);
 		}
 	}
+	PG_CATCH();
+	{
+		PQfinish(conn);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	PQfinish(conn);
+}
+
+static void
+restore_full_logical(const char *target_db, char **files, int file_count,
+					 TimestampTz stop_at, bool has_stop_at,
+					 const char *password)
+{
+	ParsedLogicalFull full;
+	char	   *temp_dbname;
+	uint64		prev_stop_lsn;
+	int			i;
+
+	load_logical_full_backup(files[0], password, &full);
+	prev_stop_lsn = full.stop_lsn;
+	validate_logical_restore_chain(files, file_count, password,
+								   full.db_name, full.stop_lsn);
 
 	temp_dbname = pgbu_generate_temp_dbname();
 
@@ -633,14 +805,6 @@ restore_full(const char *target_db, char **files, int file_count,
 				pgbu_quote_db_identifier(temp_dbname));
 			pgbu_libpq_exec(admin, create_sql, "CREATE DATABASE temp");
 			pfree(create_sql);
-
-			temp_db_oid = libpq_query_db_oid(admin, temp_dbname);
-			if (temp_db_oid == InvalidOid)
-				ereport(ERROR,
-						(errcode(ERRCODE_INTERNAL_ERROR),
-						 errmsg("temp DB \"%s\" has invalid oid", temp_dbname)));
-
-			terminate_db_connections(admin, temp_db_oid);
 		}
 		PG_CATCH();
 		{
@@ -651,179 +815,72 @@ restore_full(const char *target_db, char **files, int file_count,
 		PQfinish(admin);
 	}
 
-	snprintf(temp_db_dir, sizeof(temp_db_dir), "%s/base/%u",
-			 DataDir, temp_db_oid);
-
 	PG_TRY();
 	{
-		uint32		injected = 0;
-		WalReplayState *replay;
-		uint64		records_total = 0;
+		PGconn	   *conn = pgbu_connect_libpq(temp_dbname);
 
-		/*
-		 * Drop any shared buffers that CREATE DATABASE may have pinned for
-		 * the temp DB before we overwrite its files on disk. Pages from
-		 * template0 would otherwise mask the injected content for any
-		 * backend that hits the buffer pool. Belt-and-suspenders: we also
-		 * release per-backend smgr handles so the next read goes to fresh
-		 * file descriptors.
-		 */
-		DropDatabaseBuffers(temp_db_oid);
-		smgrreleaseall();
-
-		clear_db_dir(temp_db_dir);
-
-		ereport(NOTICE,
-				(errmsg("injecting %u files into base/%u/",
-						baks[0].entry_count, temp_db_oid)));
-
-		for (i = 0; i < (int) baks[0].entry_count; i++)
+		PG_TRY();
 		{
-			BakDataEntry *e = &baks[0].entries[i];
+			if (full.metadata_sql && full.metadata_sql[0])
+				pgbu_libpq_exec_schema_idempotent(conn, full.metadata_sql);
 
-			CHECK_FOR_INTERRUPTS();
-
-			if (inject_relfile(e->path, baks[0].src_db_oid, temp_db_oid,
-							    baks[0].entry_data[i], (size_t) e->data_len))
-				injected++;
-		}
-
-		if (injected == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("FULL .bak contained no base/<dboid>/ entries"),
-					 errdetail("src_dboid in backup header is %u, looked for base/%u/...",
-								baks[0].src_db_oid, baks[0].src_db_oid)));
-
-		for (k = 1; k < file_count; k++)
-		{
-			if (baks[k].type == BACKUP_TYPE_DIFFERENTIAL)
+			if (full.schema_sql && full.schema_sql[0])
 			{
-				for (i = 0; i < (int) baks[k].entry_count; i++)
+				ereport(NOTICE,
+						(errmsg("applying SCHEMA section")));
+				pgbu_libpq_exec(conn, full.schema_sql, "SCHEMA");
+			}
+
+			pgbu_libpq_exec(conn, "SET session_replication_role = replica",
+							"disable restore triggers for FULL data load");
+			restore_logical_full_data_entries(conn, files[0], password,
+											  full.entry_count);
+			pgbu_libpq_exec(conn, "SET session_replication_role = origin",
+							"restore trigger firing mode after FULL data load");
+
+			if (full.metadata_sql && full.metadata_sql[0])
+			{
+				ereport(NOTICE,
+						(errmsg("applying METADATA")));
+				pgbu_libpq_exec(conn, full.metadata_sql, "METADATA");
+			}
+
+			if (has_stop_at && stop_at < (TimestampTz) full.created_at)
+			{
+				ereport(NOTICE,
+						(errmsg("stop_at point is before the FULL backup window; using captured FULL image")));
+			}
+			else
+			{
+				for (i = 1; i < file_count; i++)
 				{
-					BakDataEntry *e = &baks[k].entries[i];
+					bool		stopped;
+					uint64		next_stop_lsn;
 
-					CHECK_FOR_INTERRUPTS();
-
-					if (inject_block_entry(e->path, baks[k].src_db_oid,
-											temp_db_oid,
-											baks[k].entry_data[i],
-											(size_t) e->data_len))
-						continue;
-
-					(void) inject_relfile(e->path, baks[k].src_db_oid,
-										   temp_db_oid,
-										   baks[k].entry_data[i],
-										   (size_t) e->data_len);
+					ereport(NOTICE,
+							(errmsg("applying logical stream backup %d/%d",
+									i, file_count - 1)));
+					stopped = logical_apply_log_file(conn, files[i], password,
+													 full.db_name,
+													 prev_stop_lsn,
+													 stop_at, has_stop_at,
+													 &next_stop_lsn);
+					prev_stop_lsn = next_stop_lsn;
+					if (stopped)
+						break;
 				}
 			}
-		}
 
-		/*
-		 * Scan the WAL sections in chain order. We do not apply records
-		 * here — same-cluster restores are made consistent by the
-		 * captured page images plus the live cluster's existing CLOG.
-		 * The scan still honours the PITR cutoff so callers see a clean
-		 * stop_at-aware result; see wal_replay.c for the rationale.
-		 */
-		replay = wal_replay_init(baks[0].src_db_oid, temp_db_oid);
-		for (k = 0; k < file_count; k++)
+			repair_owned_sequence_state(conn);
+		}
+		PG_CATCH();
 		{
-			records_total +=
-				wal_replay_scan_bak(replay, files[k], password,
-									 has_stop_at, stop_at);
-			if (replay->stopped_for_pitr)
-				break;
+			PQfinish(conn);
+			PG_RE_THROW();
 		}
+		PG_END_TRY();
 
-		if (has_stop_at && !replay->stopped_for_pitr)
-		{
-			/*
-			 * stop_at lies past every commit captured in the chain. That's
-			 * fine — the restore reflects the entire chain's end state
-			 * (modulo the no-replay caveat below). Emit an informational
-			 * NOTICE.
-			 */
-			ereport(NOTICE,
-					(errmsg("stop_at point lies past the last commit in the backup chain; restoring to chain end")));
-		}
-
-		if (records_total > 0)
-		{
-			ereport(NOTICE,
-					(errmsg("scanned %lu WAL records from backup chain (no apply pass; see wal_replay.c)",
-							(unsigned long) records_total),
-					 errdetail("Restored data reflects the page-level state captured during do_pg_backup_start. Post-backup changes recorded in DIFF/LOG WAL sections are not yet applied.")));
-		}
-
-		wal_replay_free(replay);
-
-		/*
-		 * Final flush: ensure the temp DB's injected pages are
-		 * authoritative by once again clearing any stragglers from the
-		 * buffer pool, then issuing an immediate checkpoint so smgr write-
-		 * back catches any incidentally-dirty pages (there should be none
-		 * since we wrote files directly).
-		 */
-		DropDatabaseBuffers(temp_db_oid);
-		smgrreleaseall();
-		RequestCheckpoint(CHECKPOINT_FAST | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
-
-		{
-			PGconn	   *admin = pgbu_connect_libpq("postgres");
-
-			PG_TRY();
-			{
-				StringInfoData sql;
-
-				initStringInfo(&sql);
-				appendStringInfo(&sql,
-								 "UPDATE pg_catalog.pg_database "
-								 "SET datfrozenxid = '%u'::xid, "
-								 "    datminmxid = '%u'::xid "
-								 "WHERE oid = %u",
-								 baks[0].frozen_xid,
-								 baks[0].min_mxid,
-								 temp_db_oid);
-				if (baks[0].frozen_xid != 0 || baks[0].min_mxid != 0)
-					pgbu_libpq_exec(admin, sql.data,
-									"advance datfrozenxid/datminmxid");
-				pfree(sql.data);
-
-				terminate_db_connections(admin, temp_db_oid);
-			}
-			PG_CATCH();
-			{
-				PQfinish(admin);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-			PQfinish(admin);
-		}
-
-		if (baks[0].metadata_sql && baks[0].metadata_sql[0])
-		{
-			PGconn	   *conn = NULL;
-
-			PG_TRY();
-			{
-				conn = pgbu_connect_libpq(temp_dbname);
-				pgbu_libpq_exec(conn, baks[0].metadata_sql, "METADATA");
-			}
-			PG_CATCH();
-			{
-				if (conn)
-					PQfinish(conn);
-				FlushErrorState();
-				ereport(NOTICE,
-						(errmsg("METADATA reapply failed against restored temp DB; "
-								"continuing with data-only restore")));
-				conn = NULL;
-			}
-			PG_END_TRY();
-			if (conn)
-				PQfinish(conn);
-		}
+		PQfinish(conn);
 	}
 	PG_CATCH();
 	{
@@ -867,5 +924,36 @@ restore_full(const char *target_db, char **files, int file_count,
 		PQfinish(admin);
 	}
 
+	prepare_logical_continuation(target_db, full.db_name, prev_stop_lsn);
+
 	pfree(temp_dbname);
+}
+
+
+void
+restore_full(const char *target_db, char **files, int file_count,
+			 TimestampTz stop_at, bool has_stop_at, const char *password)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to perform restores")));
+
+	if (file_count < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("at least one .bak file required")));
+
+	if (logical_full_backup_has_schema(files[0], password))
+	{
+		restore_full_logical(target_db, files, file_count,
+							 stop_at, has_stop_at, password);
+		return;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+			 errmsg("FULL restore requires a v1 logical FULL backup"),
+			 errdetail("The first .bak has no SCHEMA section and looks like an obsolete physical FULL artifact.")));
+
 }

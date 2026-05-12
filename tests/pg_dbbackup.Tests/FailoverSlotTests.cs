@@ -1,6 +1,5 @@
-using System.Text;
+using System.Diagnostics;
 using DotNet.Testcontainers.Builders;
-using DotNet.Testcontainers.Configurations;
 using DotNet.Testcontainers.Containers;
 using DotNet.Testcontainers.Networks;
 using Npgsql;
@@ -9,33 +8,29 @@ using Xunit;
 
 namespace PgDbBackup.Tests;
 
-public sealed class PgdogTests
+public sealed class FailoverSlotTests
 {
-    private const string PgdogImage = "ghcr.io/pgdogdev/pgdog:latest";
     private const string PostgresUser = "postgres";
     private const string PostgresPassword = "postgres";
     private const string PostgresDb = "postgres";
 
     [Fact]
-    public async Task Pgdog_Backup_Primary_Route_Succeeds_Replica_Route_Errors()
+    public async Task FullLog_Refuses_To_Continue_After_Promotion_When_Failover_Slot_Not_Ready()
     {
         var image = await CachedPgDbBackupImage.BuildAsync("postgres:17", "17");
-        var dbName = "pgdog_" + Guid.NewGuid().ToString("N")[..8];
-        var fullPath = $"/tmp/{dbName}_full.bak";
-        var primaryPgdogConfigDir = Path.Combine(
+        var dbName = "failover_" + Guid.NewGuid().ToString("N")[..8];
+        var targetDb = "failover_restored_" + Guid.NewGuid().ToString("N")[..8];
+        const string fullPath = "/tmp/failover_full.bak";
+        const string logPath = "/tmp/failover_log.bak";
+        var hostFullPath = Path.Combine(
             Path.GetTempPath(),
-            $"pgdbbackup_pgdog_primary_{Guid.NewGuid():N}");
-        var standbyPgdogConfigDir = Path.Combine(
-            Path.GetTempPath(),
-            $"pgdbbackup_pgdog_standby_{Guid.NewGuid():N}");
+            $"pgdbbackup_failover_{Guid.NewGuid():N}.bak");
 
         await using var network = new NetworkBuilder().Build();
         await network.CreateAsync();
 
         IContainer? primary = null;
         IContainer? standby = null;
-        IContainer? primaryPgdog = null;
-        IContainer? standbyPgdog = null;
 
         try
         {
@@ -69,6 +64,13 @@ public sealed class PgdogTests
 
             await using (var admin = await ConnectAsync(primary, PostgresDb))
             {
+                await ExecSqlAsync(admin,
+                    "ALTER SYSTEM SET synchronized_standby_slots = 'standby_slot'");
+                await ExecSqlAsync(admin, "SELECT pg_reload_conf()");
+            }
+
+            await using (var admin = await ConnectAsync(primary, PostgresDb))
+            {
                 await ExecSqlAsync(admin, $"CREATE DATABASE \"{dbName}\"");
             }
 
@@ -79,92 +81,86 @@ public sealed class PgdogTests
                     "SELECT dbbackup.pg_dbbackup_set_mode(current_database(), 'full');" +
                     "CREATE TABLE items(id int PRIMARY KEY, v text);" +
                     "INSERT INTO items VALUES (1, 'base');");
+
+                await BackupAsync(source, "full", fullPath, null);
+
+                var slotName = await ScalarAsync<string>(source,
+                    "SELECT '_pg_dbbackup_' || " +
+                    "(SELECT oid::text FROM pg_database WHERE datname = current_database())");
+
+                await WaitForFailoverSlotObservedAsync(standby, dbName, slotName);
+
+                await using (var standbyAdmin = await ConnectAsync(standby, PostgresDb))
+                {
+                    Assert.False(await ScalarAsync<bool>(standbyAdmin,
+                        "SELECT dbbackup.pg_dbbackup_failover_slot_ready(@db)",
+                        ("db", dbName)));
+                    Assert.False(await ScalarAsync<bool>(standbyAdmin,
+                        "SELECT dbbackup.pg_dbbackup_wait_failover_slot_ready(@db, 1)",
+                        ("db", dbName)));
+                    Assert.True(await ScalarAsync<bool>(standbyAdmin,
+                        "SELECT synced AND temporary AND NOT standby_ready " +
+                        "FROM dbbackup.pg_dbbackup_failover_slot_status(@db)",
+                        ("db", dbName)));
+                }
+
+                await ExecSqlAsync(source,
+                    "INSERT INTO items VALUES (2, 'after-failover')");
+                var replayLsn = await ScalarAsync<string>(source,
+                    "SELECT pg_current_wal_lsn()::text");
+
+                await WaitForConditionAsync(async () =>
+                {
+                    await using var standbyAdmin = await ConnectAsync(standby, PostgresDb);
+                    return await ScalarAsync<bool>(standbyAdmin,
+                        "SELECT pg_last_wal_replay_lsn() >= @lsn::pg_lsn",
+                        ("lsn", replayLsn));
+                }, "standby replay catch-up");
+            }
+
+            await DockerCpFromAsync(primary, fullPath, hostFullPath);
+            await DockerCpToAsync(hostFullPath, standby, fullPath);
+
+            await primary.StopAsync();
+            await using (var standbyAdmin = await ConnectAsync(standby, PostgresDb))
+            {
+                Assert.True(await ScalarAsync<bool>(standbyAdmin, "SELECT pg_promote(true, 60)"));
             }
 
             await WaitForConditionAsync(async () =>
             {
-                try
-                {
-                    await using var replica = await ConnectAsync(standby, dbName);
-                    return await ScalarAsync<long>(replica, "SELECT count(*) FROM items") == 1;
-                }
-                catch
-                {
-                    return false;
-                }
-            }, "standby to replay source database");
+                await using var standbyAdmin = await ConnectAsync(standby, PostgresDb);
+                return await ScalarAsync<bool>(standbyAdmin,
+                    "SELECT NOT pg_is_in_recovery()");
+            }, "standby promotion");
 
-            primaryPgdog = BuildPgdog(
-                network,
-                backendAlias: "pg-primary",
-                backendRole: "primary",
-                dbName,
-                routeAlias: "pgdog-primary-route",
-                configDir: primaryPgdogConfigDir);
-            await primaryPgdog.StartAsync();
-            await WaitForPgdogConnectionAsync(primaryPgdog, dbName, "primary route");
-
-            await using (var throughPrimary = await ConnectPgdogAsync(primaryPgdog, dbName))
+            await using (var promoted = await ConnectAsync(standby, dbName))
             {
-                Assert.False(await ScalarAsync<bool>(
-                    throughPrimary,
-                    "SELECT pg_is_in_recovery()"));
-
-                await BackupAsync(throughPrimary, "full", fullPath, null);
+                var ex = await Assert.ThrowsAsync<PostgresException>(async () =>
+                    await BackupAsync(promoted, "log", logPath, fullPath));
+                Assert.Contains("does not exist", ex.MessageText);
             }
-
-            await ShellOrThrowAsync(primary,
-                $"test -s '{fullPath}'",
-                "primary-route pgdog backup output exists");
-
-            await using (var source = await ConnectAsync(primary, dbName))
-            {
-                Assert.True(await ScalarAsync<bool>(source,
-                    "SELECT EXISTS (" +
-                    "  SELECT 1 FROM dbbackup.logical_chains " +
-                    "  WHERE db_name = current_database() AND slot_name IS NOT NULL)"));
-            }
-
-            await using (var directStandby = await ConnectAsync(standby, dbName))
-            {
-                Assert.True(await ScalarAsync<bool>(
-                    directStandby,
-                    "SELECT pg_is_in_recovery()"));
-
-                var ex = await Assert.ThrowsAnyAsync<Exception>(async () =>
-                    await BackupAsync(directStandby, "full", $"/tmp/{dbName}_direct_standby.bak", null));
-                AssertStandbyBackupError(ex);
-            }
-
-            standbyPgdog = BuildPgdog(
-                network,
-                backendAlias: "pg-standby",
-                backendRole: "replica",
-                dbName,
-                routeAlias: "pgdog-standby-route",
-                configDir: standbyPgdogConfigDir);
-            await standbyPgdog.StartAsync();
-
-            var pgdogEx = await Assert.ThrowsAnyAsync<Exception>(async () =>
-            {
-                await using var throughStandby = await ConnectPgdogAsync(standbyPgdog, dbName);
-                await BackupAsync(throughStandby, "full", $"/tmp/{dbName}_pgdog_standby.bak", null);
-            });
-            AssertPgdogStandbyRouteError(pgdogEx);
         }
         finally
         {
-            if (standbyPgdog is not null)
-                await standbyPgdog.DisposeAsync();
-            if (primaryPgdog is not null)
-                await primaryPgdog.DisposeAsync();
+            try { File.Delete(hostFullPath); } catch { }
+
             if (standby is not null)
+            {
+                try
+                {
+                    await using var admin = await ConnectAsync(standby, PostgresDb);
+                    await ExecSqlAsync(admin,
+                        $"DROP DATABASE IF EXISTS \"{targetDb}\" WITH (FORCE);" +
+                        $"DROP DATABASE IF EXISTS \"{dbName}\" WITH (FORCE);");
+                }
+                catch { }
+
                 await standby.DisposeAsync();
+            }
+
             if (primary is not null)
                 await primary.DisposeAsync();
-
-            DeleteDirectoryQuietly(primaryPgdogConfigDir);
-            DeleteDirectoryQuietly(standbyPgdogConfigDir);
         }
     }
 
@@ -233,64 +229,7 @@ public sealed class PgdogTests
             .Build();
     }
 
-    private static IContainer BuildPgdog(
-        INetwork network,
-        string backendAlias,
-        string backendRole,
-        string dbName,
-        string routeAlias,
-        string configDir)
-    {
-        Directory.CreateDirectory(configDir);
-        File.WriteAllText(
-            Path.Combine(configDir, "pgdog.toml"),
-            PgdogConfig(backendAlias, backendRole, dbName),
-            Encoding.ASCII);
-        File.WriteAllText(
-            Path.Combine(configDir, "users.toml"),
-            PgdogUsers(dbName),
-            Encoding.ASCII);
-
-        return new ContainerBuilder()
-            .WithImage(PgdogImage)
-            .WithNetwork(network)
-            .WithNetworkAliases(routeAlias)
-            .WithPortBinding(6432, true)
-            .WithBindMount(configDir, "/config", AccessMode.ReadOnly)
-            .WithCommand(
-                "pgdog",
-                "-c", "/config/pgdog.toml",
-                "-u", "/config/users.toml",
-                "run")
-            .WithWaitStrategy(Wait.ForUnixContainer()
-                .AddCustomWaitStrategy(new ImmediateReadyWait()))
-            .Build();
-    }
-
-    private static string PgdogConfig(string backendAlias, string backendRole, string dbName) =>
-        $"""
-        [general]
-        port = 6432
-        default_pool_size = 2
-        min_pool_size = 0
-
-        [[databases]]
-        name = "{dbName}"
-        host = "{backendAlias}"
-        port = 5432
-        database_name = "{dbName}"
-        role = "{backendRole}"
-        """;
-
-    private static string PgdogUsers(string dbName) =>
-        $"""
-        [[users]]
-        name = "{PostgresUser}"
-        database = "{dbName}"
-        password = "{PostgresPassword}"
-        """;
-
-    private static string PostgresConnectionString(IContainer container, string database = PostgresDb) =>
+    private static string ConnectionString(IContainer container, string database = PostgresDb) =>
         new NpgsqlConnectionStringBuilder
         {
             Host = "localhost",
@@ -299,35 +238,13 @@ public sealed class PgdogTests
             Password = PostgresPassword,
             Database = database,
             Pooling = false,
-            Timeout = 5,
-        }.ConnectionString;
-
-    private static string PgdogConnectionString(IContainer container, string database) =>
-        new NpgsqlConnectionStringBuilder
-        {
-            Host = "localhost",
-            Port = container.GetMappedPublicPort(6432),
-            Username = PostgresUser,
-            Password = PostgresPassword,
-            Database = database,
-            Pooling = false,
-            Timeout = 5,
         }.ConnectionString;
 
     private static async Task<NpgsqlConnection> ConnectAsync(
         IContainer container,
         string database)
     {
-        var conn = new NpgsqlConnection(PostgresConnectionString(container, database));
-        await conn.OpenAsync();
-        return conn;
-    }
-
-    private static async Task<NpgsqlConnection> ConnectPgdogAsync(
-        IContainer container,
-        string database)
-    {
-        var conn = new NpgsqlConnection(PgdogConnectionString(container, database));
+        var conn = new NpgsqlConnection(ConnectionString(container, database));
         await conn.OpenAsync();
         return conn;
     }
@@ -336,7 +253,7 @@ public sealed class PgdogTests
         IContainer container,
         string label)
     {
-        var connectionString = PostgresConnectionString(container);
+        var connectionString = ConnectionString(container);
         var deadline = DateTime.UtcNow.AddSeconds(120);
         Exception? last = null;
         while (DateTime.UtcNow < deadline)
@@ -362,37 +279,6 @@ public sealed class PgdogTests
             last);
     }
 
-    private static async Task WaitForPgdogConnectionAsync(
-        IContainer container,
-        string database,
-        string label)
-    {
-        var connectionString = PgdogConnectionString(container, database);
-        var deadline = DateTime.UtcNow.AddSeconds(90);
-        Exception? last = null;
-        while (DateTime.UtcNow < deadline)
-        {
-            try
-            {
-                await using var conn = new NpgsqlConnection(connectionString);
-                await conn.OpenAsync();
-                await using var cmd = conn.CreateCommand();
-                cmd.CommandText = "SELECT 1";
-                await cmd.ExecuteScalarAsync();
-                return;
-            }
-            catch (Exception e)
-            {
-                last = e;
-                await Task.Delay(500);
-            }
-        }
-
-        throw new InvalidOperationException(
-            $"Pgdog {label} was not ready in time{await LogsAsync(container)}",
-            last);
-    }
-
     private static async Task WaitForConditionAsync(
         Func<Task<bool>> predicate,
         string label,
@@ -407,6 +293,39 @@ public sealed class PgdogTests
         }
 
         throw new TimeoutException($"Timed out waiting for {label}");
+    }
+
+    private static async Task WaitForFailoverSlotObservedAsync(
+        IContainer standby,
+        string dbName,
+        string slotName)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(90);
+        var lastState = "<not checked>";
+
+        while (DateTime.UtcNow < deadline)
+        {
+            await using var standbyAdmin = await ConnectAsync(standby, PostgresDb);
+            lastState = await ScalarAsync<string>(standbyAdmin,
+                "SELECT COALESCE((" +
+                "  SELECT to_jsonb(s)::text FROM pg_replication_slots s " +
+                "  WHERE slot_name = @slot), '<missing>')",
+                ("slot", slotName));
+
+            var observed = await ScalarAsync<bool>(standbyAdmin,
+                "SELECT COALESCE((" +
+                "  SELECT slot_exists " +
+                "  FROM dbbackup.pg_dbbackup_failover_slot_status(@db)), false)",
+                ("db", dbName));
+            if (observed)
+                return;
+
+            await Task.Delay(500);
+        }
+
+        throw new TimeoutException(
+            "Timed out waiting for synced logical failover slot to appear " +
+            $"on standby. Last slot state: {lastState}{await LogsAsync(standby)}");
     }
 
     private static async Task ExecSqlAsync(NpgsqlConnection conn, string sql)
@@ -448,34 +367,6 @@ public sealed class PgdogTests
         await cmd.ExecuteNonQueryAsync();
     }
 
-    private static void AssertStandbyBackupError(Exception ex)
-    {
-        var message = ex.ToString();
-        Assert.True(
-            ContainsIgnoreCase(message, "read-only") ||
-            ContainsIgnoreCase(message, "recovery") ||
-            ContainsIgnoreCase(message, "standby") ||
-            ContainsIgnoreCase(message, "cannot execute"),
-            "Expected backup through a standby route to fail with a standby/read-only " +
-            $"error, but got: {message}");
-    }
-
-    private static void AssertPgdogStandbyRouteError(Exception ex)
-    {
-        var message = ex.ToString();
-        Assert.True(
-            ContainsIgnoreCase(message, "read-only") ||
-            ContainsIgnoreCase(message, "recovery") ||
-            ContainsIgnoreCase(message, "standby") ||
-            ContainsIgnoreCase(message, "connection pool") ||
-            ContainsIgnoreCase(message, "pool is down"),
-            "Expected pgdog standby route to fail instead of routing backup to " +
-            $"primary, but got: {message}");
-    }
-
-    private static bool ContainsIgnoreCase(string value, string expected) =>
-        value.IndexOf(expected, StringComparison.OrdinalIgnoreCase) >= 0;
-
     private static async Task ShellOrThrowAsync(
         IContainer container,
         string command,
@@ -500,15 +391,41 @@ public sealed class PgdogTests
         }
     }
 
-    private static void DeleteDirectoryQuietly(string path)
+    private static async Task DockerCpFromAsync(
+        IContainer container,
+        string containerPath,
+        string hostPath)
     {
-        try
+        await DockerCpAsync($"{container.Id}:{containerPath}", hostPath);
+    }
+
+    private static async Task DockerCpToAsync(
+        string hostPath,
+        IContainer container,
+        string containerPath)
+    {
+        await DockerCpAsync(hostPath, $"{container.Id}:{containerPath}");
+    }
+
+    private static async Task DockerCpAsync(string source, string destination)
+    {
+        var psi = new ProcessStartInfo("docker")
         {
-            if (Directory.Exists(path))
-                Directory.Delete(path, recursive: true);
-        }
-        catch
-        {
-        }
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+        };
+        psi.ArgumentList.Add("cp");
+        psi.ArgumentList.Add(source);
+        psi.ArgumentList.Add(destination);
+
+        using var process = Process.Start(psi)
+            ?? throw new InvalidOperationException("failed to start docker");
+        var stderr = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        if (process.ExitCode != 0)
+            throw new InvalidOperationException(
+                $"docker cp {source} {destination} failed: {await stderr}");
     }
 }

@@ -419,8 +419,9 @@ bakfile_begin_section(BakFileWriter *writer, uint8 section_type)
 		bakfile_write_raw(writer, &zero, sizeof(zero));
 	}
 
-	writer->section_buf = makeStringInfo();
 	writer->section_bytes = 0;
+	writer->section_direct = !(writer->compress || writer->password != NULL);
+	writer->section_buf = writer->section_direct ? NULL : makeStringInfo();
 	writer->section_open = true;
 }
 
@@ -432,7 +433,13 @@ bakfile_write_section_data(BakFileWriter *writer, const void *data, size_t len)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("no section open")));
 
-	appendBinaryStringInfo(writer->section_buf, (const char *) data, len);
+	if (writer->section_direct)
+	{
+		bakfile_write_raw(writer, data, len);
+		writer->section_bytes += len;
+	}
+	else
+		appendBinaryStringInfo(writer->section_buf, (const char *) data, len);
 }
 
 void
@@ -471,9 +478,12 @@ bakfile_end_section(BakFileWriter *writer)
 	}
 	else
 	{
-		bakfile_write_raw(writer, writer->section_buf->data,
-						  writer->section_buf->len);
-		writer->section_bytes = writer->section_buf->len;
+		if (!writer->section_direct)
+		{
+			bakfile_write_raw(writer, writer->section_buf->data,
+							  writer->section_buf->len);
+			writer->section_bytes = writer->section_buf->len;
+		}
 	}
 
 	end_pos = ftello(writer->fp);
@@ -502,9 +512,13 @@ bakfile_end_section(BakFileWriter *writer)
 				 errmsg("could not seek in backup file \"%s\": %m",
 						writer->filepath)));
 
-	pfree(writer->section_buf->data);
-	pfree(writer->section_buf);
+	if (writer->section_buf)
+	{
+		pfree(writer->section_buf->data);
+		pfree(writer->section_buf);
+	}
 	writer->section_buf = NULL;
+	writer->section_direct = false;
 	writer->section_open = false;
 }
 
@@ -513,8 +527,7 @@ section_buf_append_uint16(BakFileWriter *writer, uint16 val)
 {
 	uint16		netval = pg_hton16(val);
 
-	appendBinaryStringInfo(writer->section_buf, (const char *) &netval,
-						   sizeof(netval));
+	bakfile_write_section_data(writer, &netval, sizeof(netval));
 }
 
 static void
@@ -522,8 +535,7 @@ section_buf_append_uint64(BakFileWriter *writer, uint64 val)
 {
 	uint64		netval = pg_hton64(val);
 
-	appendBinaryStringInfo(writer->section_buf, (const char *) &netval,
-						   sizeof(netval));
+	bakfile_write_section_data(writer, &netval, sizeof(netval));
 }
 
 void
@@ -542,7 +554,7 @@ bakfile_begin_data_entry(BakFileWriter *writer, const char *path,
 				 errmsg("no section open for data entry")));
 
 	section_buf_append_uint16(writer, path_len);
-	appendBinaryStringInfo(writer->section_buf, path, path_len);
+	bakfile_write_section_data(writer, path, path_len);
 	section_buf_append_uint64(writer, data_len);
 
 	writer->entry_hash_ctx = pg_cryptohash_create(PG_SHA256);
@@ -566,7 +578,7 @@ bakfile_write_data_entry_chunk(BakFileWriter *writer, const void *data,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("no data entry open")));
 
-	appendBinaryStringInfo(writer->section_buf, (const char *) data, len);
+	bakfile_write_section_data(writer, data, len);
 
 	if (pg_cryptohash_update(writer->entry_hash_ctx, data, len) < 0)
 		ereport(ERROR,
@@ -589,8 +601,7 @@ bakfile_end_data_entry(BakFileWriter *writer)
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not finalize SHA-256 context")));
 
-	appendBinaryStringInfo(writer->section_buf, (const char *) digest,
-						   sizeof(digest));
+	bakfile_write_section_data(writer, digest, sizeof(digest));
 
 	pg_cryptohash_free(writer->entry_hash_ctx);
 	writer->entry_hash_ctx = NULL;
@@ -792,7 +803,12 @@ section_plain_read(BakFileReader *reader, void *buf, size_t len)
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("attempt to read past end of section in \"%s\"",
 						reader->filepath)));
-	memcpy(buf, reader->section_plain + reader->section_plain_pos, len);
+
+	if (reader->section_direct)
+		bakfile_read_raw(reader, buf, len);
+	else
+		memcpy(buf, reader->section_plain + reader->section_plain_pos, len);
+
 	reader->section_plain_pos += len;
 }
 
@@ -834,6 +850,16 @@ bakfile_next_section(BakFileReader *reader)
 	off_t		cur_pos;
 	off_t		end_pos;
 
+	if (reader->section_direct)
+	{
+		if (fseeko(reader->fp, reader->section_end_offset, SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not skip section in \"%s\": %m",
+							reader->filepath)));
+		reader->section_direct = false;
+	}
+
 	if (reader->section_plain)
 	{
 		pfree(reader->section_plain);
@@ -841,6 +867,7 @@ bakfile_next_section(BakFileReader *reader)
 	}
 	reader->section_plain_len = 0;
 	reader->section_plain_pos = 0;
+	reader->section_end_offset = 0;
 
 	/*
 	 * Detect EOF before the footer (last 32+5 bytes = SHA-256 + tail magic):
@@ -868,16 +895,16 @@ bakfile_next_section(BakFileReader *reader)
 	reader->current_section_type = section_type;
 	reader->current_section_length = section_length;
 
-	raw = palloc(section_length == 0 ? 1 : (size_t) section_length);
-	if (section_length > 0)
-		bakfile_read_raw(reader, raw, (size_t) section_length);
-
 	do_crypto = reader->header.compressed || reader->header.encrypted;
 
 	if (do_crypto)
 	{
 		void	   *plain = NULL;
 		size_t		plain_len;
+
+		raw = palloc(section_length == 0 ? 1 : (size_t) section_length);
+		if (section_length > 0)
+			bakfile_read_raw(reader, raw, (size_t) section_length);
 
 		cctx = bakcrypto_reader_init(reader->header.compressed,
 									 reader->header.encrypted,
@@ -894,8 +921,16 @@ bakfile_next_section(BakFileReader *reader)
 	}
 	else
 	{
-		reader->section_plain = raw;
+		cur_pos = ftello(reader->fp);
+		if (cur_pos < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not get section position in \"%s\": %m",
+							reader->filepath)));
+		reader->section_plain = NULL;
 		reader->section_plain_len = (size_t) section_length;
+		reader->section_direct = true;
+		reader->section_end_offset = cur_pos + (off_t) section_length;
 	}
 
 	return section_type;
@@ -1006,6 +1041,13 @@ bakfile_list_data_entries(BakFileReader *reader, uint32 *count_out)
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("DATA entry %u extends past section in \"%s\"",
 							i, reader->filepath)));
+
+		if (reader->section_direct &&
+			fseeko(reader->fp, (off_t) data_len, SEEK_CUR) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not skip DATA entry in \"%s\": %m",
+							reader->filepath)));
 		reader->section_plain_pos += (size_t) data_len;
 
 		section_plain_read(reader, list[i].digest, sizeof(list[i].digest));
@@ -1027,9 +1069,9 @@ bakfile_read_section_all(BakFileReader *reader, char **buf_out, size_t *len_out)
 	char	   *out;
 
 	out = palloc(remaining + 1);
-	memcpy(out, reader->section_plain + reader->section_plain_pos, remaining);
+	if (remaining > 0)
+		section_plain_read(reader, out, remaining);
 	out[remaining] = '\0';
-	reader->section_plain_pos = reader->section_plain_len;
 	*buf_out = out;
 	*len_out = remaining;
 }

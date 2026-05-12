@@ -21,6 +21,15 @@
 #include "metadata_gen.h"
 #include "ddl_gen.h"
 
+#define COPY_FILE_CHUNK_SIZE (1024 * 1024)
+
+typedef struct CopyTempFile
+{
+	char	   *path;
+	size_t		len;
+	uint8		digest[32];
+} CopyTempFile;
+
 static char *
 make_copy_tempfile_path(void)
 {
@@ -31,16 +40,108 @@ make_copy_tempfile_path(void)
 }
 
 static void
-copy_table_to_buffer(const char *schema, const char *relname,
-					  char **buf_out, size_t *len_out)
+sha256_file(const char *path, uint8 digest[32])
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	FILE	   *fp;
+	char	   *buf;
+	size_t		n;
+
+	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not init SHA-256 context")));
+
+	fp = AllocateFile(path, "rb");
+	if (fp == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open COPY output \"%s\": %m", path)));
+
+	buf = palloc(COPY_FILE_CHUNK_SIZE);
+	while ((n = fread(buf, 1, COPY_FILE_CHUNK_SIZE, fp)) > 0)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (pg_cryptohash_update(ctx, buf, n) < 0)
+		{
+			pfree(buf);
+			FreeFile(fp);
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not update SHA-256 context")));
+		}
+	}
+
+	if (ferror(fp))
+	{
+		pfree(buf);
+		FreeFile(fp);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not read COPY output \"%s\": %m", path)));
+	}
+
+	pfree(buf);
+	FreeFile(fp);
+
+	if (pg_cryptohash_final(ctx, digest, 32) < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not finalize SHA-256 context")));
+	pg_cryptohash_free(ctx);
+}
+
+static char *
+copy_column_list_for_table(const char *schema, const char *relname)
+{
+	StringInfoData sql;
+	int			ret;
+	char	   *cols;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT string_agg(quote_ident(a.attname), ', ' "
+					 "                  ORDER BY a.attnum) "
+					 "FROM pg_class c "
+					 "JOIN pg_namespace n ON c.relnamespace = n.oid "
+					 "JOIN pg_attribute a ON a.attrelid = c.oid "
+					 "WHERE n.nspname = %s "
+					 "  AND c.relname = %s "
+					 "  AND a.attnum > 0 "
+					 "  AND NOT a.attisdropped "
+					 "  AND a.attgenerated = ''",
+					 quote_literal_cstr(schema),
+					 quote_literal_cstr(relname));
+
+	ret = SPI_execute(sql.data, true, 1);
+	pfree(sql.data);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not enumerate backup columns for %s.%s (rc=%d)",
+						schema, relname, ret)));
+
+	cols = SPI_getvalue(SPI_tuptable->vals[0],
+						SPI_tuptable->tupdesc, 1);
+	if (cols == NULL || cols[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("table %s.%s has no restorable columns",
+						schema, relname)));
+
+	return pstrdup(cols);
+}
+
+static void
+copy_table_to_tempfile(const char *schema, const char *relname,
+					   CopyTempFile *out)
 {
 	char	   *tmp_path = make_copy_tempfile_path();
+	char	   *cols = copy_column_list_for_table(schema, relname);
 	StringInfoData copy_sql;
 	int			ret;
-	FILE	   *fp;
 	struct stat st;
-	char	   *buf = NULL;
-	size_t		filesize;
 
 	initStringInfo(&copy_sql);
 	/*
@@ -50,18 +151,24 @@ copy_table_to_buffer(const char *schema, const char *relname,
 	 * planner, not just the parent's heap.
 	 */
 	appendStringInfo(&copy_sql,
-					 "COPY (SELECT * FROM %s.%s) TO %s (FORMAT binary)",
+					 "COPY (SELECT %s FROM %s.%s) TO %s (FORMAT binary)",
+					 cols,
 					 quote_identifier(schema),
 					 quote_identifier(relname),
 					 quote_literal_cstr(tmp_path));
+	pfree(cols);
 
 	ret = SPI_execute(copy_sql.data, false, 0);
 	pfree(copy_sql.data);
 	if (ret != SPI_OK_UTILITY)
+	{
+		(void) unlink(tmp_path);
+		pfree(tmp_path);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("COPY ... TO file failed for %s.%s (SPI rc=%d)",
 						schema, relname, ret)));
+	}
 
 	if (stat(tmp_path, &st) != 0)
 	{
@@ -72,36 +179,52 @@ copy_table_to_buffer(const char *schema, const char *relname,
 				(errcode_for_file_access(),
 				 errmsg("could not stat COPY output \"%s\": %m", tmp_path)));
 	}
-	filesize = (size_t) st.st_size;
 
-	buf = palloc(filesize > 0 ? filesize : 1);
+	out->path = tmp_path;
+	out->len = (size_t) st.st_size;
+	sha256_file(tmp_path, out->digest);
+}
 
-	fp = AllocateFile(tmp_path, "rb");
+static void
+write_tempfile_to_data_entry(BakFileWriter *writer, const char *path,
+							 size_t expected_len)
+{
+	FILE	   *fp;
+	char	   *buf;
+	size_t		n;
+	size_t		total = 0;
+
+	fp = AllocateFile(path, "rb");
 	if (fp == NULL)
-	{
-		(void) unlink(tmp_path);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not open COPY output \"%s\": %m", tmp_path)));
+				 errmsg("could not open COPY output \"%s\": %m", path)));
+
+	buf = palloc(COPY_FILE_CHUNK_SIZE);
+	while ((n = fread(buf, 1, COPY_FILE_CHUNK_SIZE, fp)) > 0)
+	{
+		CHECK_FOR_INTERRUPTS();
+		bakfile_write_data_entry_chunk(writer, buf, n);
+		total += n;
 	}
 
-	if (filesize > 0 && fread(buf, 1, filesize, fp) != filesize)
+	if (ferror(fp))
 	{
-		int			save_errno = errno;
+		pfree(buf);
 		FreeFile(fp);
-		(void) unlink(tmp_path);
-		errno = save_errno;
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not read COPY output \"%s\": %m", tmp_path)));
+				 errmsg("could not read COPY output \"%s\": %m", path)));
 	}
 
+	pfree(buf);
 	FreeFile(fp);
-	(void) unlink(tmp_path);
-	pfree(tmp_path);
 
-	*buf_out = buf;
-	*len_out = filesize;
+	if (total != expected_len)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("COPY output \"%s\" changed size while reading",
+						path)));
 }
 
 typedef struct TableId
@@ -175,8 +298,10 @@ current_tli(void)
 }
 
 void
-backup_simple_full(Oid db_oid, const char *db_name, const char *filepath,
-				   bool compress, const char *password)
+backup_simple_full_as_mode_lsn(Oid db_oid, const char *db_name,
+							   const char *filepath,
+							   bool compress, const char *password,
+							   PgDbBackupMode mode, XLogRecPtr chain_lsn)
 {
 	BakFileHeader header;
 	BakFileWriter *writer;
@@ -208,12 +333,12 @@ backup_simple_full(Oid db_oid, const char *db_name, const char *filepath,
 
 	memset(&header, 0, sizeof(header));
 	header.format_version = BAKFILE_VERSION;
-	header.mode = BACKUP_MODE_SIMPLE;
+	header.mode = mode;
 	header.type = BACKUP_TYPE_FULL;
 	strlcpy(header.db_name, db_name, sizeof(header.db_name));
 	header.db_oid = db_oid;
-	header.start_lsn = (uint64) start_lsn;
-	header.stop_lsn = (uint64) start_lsn;
+	header.start_lsn = (uint64) (XLogRecPtrIsInvalid(chain_lsn) ? start_lsn : chain_lsn);
+	header.stop_lsn = header.start_lsn;
 	header.start_tli = current_tli();
 	header.stop_tli = header.start_tli;
 	header.pg_version = PG_VERSION_NUM;
@@ -253,10 +378,10 @@ backup_simple_full(Oid db_oid, const char *db_name, const char *filepath,
 
 	for (uint32 i = 0; i < table_count; i++)
 	{
-		char	   *copy_buf = NULL;
-		size_t		copy_len = 0;
+		CopyTempFile copy_file;
 		char	   *entry_path;
 
+		memset(&copy_file, 0, sizeof(copy_file));
 		CHECK_FOR_INTERRUPTS();
 
 		ereport(NOTICE,
@@ -264,54 +389,55 @@ backup_simple_full(Oid db_oid, const char *db_name, const char *filepath,
 						i + 1, table_count,
 						tables[i].schema, tables[i].relname)));
 
-		copy_table_to_buffer(tables[i].schema, tables[i].relname,
-							 &copy_buf, &copy_len);
+		copy_table_to_tempfile(tables[i].schema, tables[i].relname,
+							   &copy_file);
 
 		entry_path = psprintf("%s.%s", tables[i].schema, tables[i].relname);
-		bakfile_begin_data_entry(writer, entry_path, (uint64) copy_len);
-		if (copy_len > 0)
-			bakfile_write_data_entry_chunk(writer, copy_buf, copy_len);
+		bakfile_begin_data_entry(writer, entry_path, (uint64) copy_file.len);
+		if (copy_file.len > 0)
+			write_tempfile_to_data_entry(writer, copy_file.path,
+										 copy_file.len);
 		bakfile_end_data_entry(writer);
 
 		pfree(entry_path);
-		if (copy_buf)
-			pfree(copy_buf);
+		if (copy_file.path)
+		{
+			(void) unlink(copy_file.path);
+			pfree(copy_file.path);
+		}
 	}
 
 	bakfile_end_section(writer);
 
-	SPI_finish();
+	bakfile_close(writer);
 
+	SPI_finish();
 	stop_lsn = current_lsn();
 	(void) stop_lsn;
-
-	bakfile_close(writer);
 
 	UnlockSharedObject(DatabaseRelationId, db_oid, 0, AccessShareLock);
 
 	ereport(NOTICE,
-			(errmsg("SIMPLE FULL backup of \"%s\" complete: %u tables written to \"%s\"",
+			(errmsg("%s FULL backup of \"%s\" complete: %u tables written to \"%s\"",
+					mode == BACKUP_MODE_FULL ? "FULL" : "SIMPLE",
 					db_name, table_count, filepath)));
 }
 
-static void
-sha256_buffer(const void *data, size_t len, uint8 digest[32])
+void
+backup_simple_full_as_mode(Oid db_oid, const char *db_name, const char *filepath,
+						   bool compress, const char *password,
+						   PgDbBackupMode mode)
 {
-	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	backup_simple_full_as_mode_lsn(db_oid, db_name, filepath, compress,
+								   password, mode, InvalidXLogRecPtr);
+}
 
-	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not init SHA-256 context")));
-	if (len > 0 && pg_cryptohash_update(ctx, data, len) < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not update SHA-256 context")));
-	if (pg_cryptohash_final(ctx, digest, 32) < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not finalize SHA-256 context")));
-	pg_cryptohash_free(ctx);
+void
+backup_simple_full(Oid db_oid, const char *db_name, const char *filepath,
+				   bool compress, const char *password)
+{
+	backup_simple_full_as_mode(db_oid, db_name, filepath, compress, password,
+							   BACKUP_MODE_SIMPLE);
 }
 
 typedef struct BaseEntryDigest
@@ -414,7 +540,7 @@ find_base_entry(const BaseEntryDigest *base, uint32 base_count,
 typedef struct ChangedTable
 {
 	char	   *entry_path;
-	char	   *copy_buf;
+	char	   *tmp_path;
 	size_t		copy_len;
 } ChangedTable;
 
@@ -500,31 +626,31 @@ backup_simple_differential(Oid db_oid, const char *db_name,
 
 	for (uint32 i = 0; i < table_count; i++)
 	{
-		char	   *copy_buf = NULL;
-		size_t		copy_len = 0;
+		CopyTempFile copy_file;
 		char	   *entry_path;
-		uint8		cur_digest[32];
 		const BaseEntryDigest *base_entry;
 
+		memset(&copy_file, 0, sizeof(copy_file));
 		CHECK_FOR_INTERRUPTS();
 
-		copy_table_to_buffer(tables[i].schema, tables[i].relname,
-							 &copy_buf, &copy_len);
-
-		sha256_buffer(copy_buf, copy_len, cur_digest);
+		copy_table_to_tempfile(tables[i].schema, tables[i].relname,
+							   &copy_file);
 
 		entry_path = psprintf("%s.%s", tables[i].schema, tables[i].relname);
 		base_entry = find_base_entry(base_digests, base_count, entry_path);
 
 		if (base_entry != NULL &&
-			memcmp(base_entry->digest, cur_digest, 32) == 0)
+			memcmp(base_entry->digest, copy_file.digest, 32) == 0)
 		{
 			ereport(NOTICE,
 					(errmsg("skipping unchanged table %s.%s",
 							tables[i].schema, tables[i].relname)));
 			pfree(entry_path);
-			if (copy_buf)
-				pfree(copy_buf);
+			if (copy_file.path)
+			{
+				(void) unlink(copy_file.path);
+				pfree(copy_file.path);
+			}
 			continue;
 		}
 
@@ -534,8 +660,8 @@ backup_simple_differential(Oid db_oid, const char *db_name,
 						base_entry == NULL ? " (new)" : "")));
 
 		changed[changed_count].entry_path = entry_path;
-		changed[changed_count].copy_buf = copy_buf;
-		changed[changed_count].copy_len = copy_len;
+		changed[changed_count].tmp_path = copy_file.path;
+		changed[changed_count].copy_len = copy_file.len;
 		changed_count++;
 	}
 
@@ -567,25 +693,28 @@ backup_simple_differential(Oid db_oid, const char *db_name,
 		bakfile_begin_data_entry(writer, changed[i].entry_path,
 								  (uint64) changed[i].copy_len);
 		if (changed[i].copy_len > 0)
-			bakfile_write_data_entry_chunk(writer, changed[i].copy_buf,
-										   changed[i].copy_len);
+			write_tempfile_to_data_entry(writer, changed[i].tmp_path,
+										 changed[i].copy_len);
 		bakfile_end_data_entry(writer);
 
 		pfree(changed[i].entry_path);
-		if (changed[i].copy_buf)
-			pfree(changed[i].copy_buf);
+		if (changed[i].tmp_path)
+		{
+			(void) unlink(changed[i].tmp_path);
+			pfree(changed[i].tmp_path);
+		}
 	}
 
 	bakfile_end_section(writer);
 
 	bakfile_close(writer);
 
+	if (changed)
+		pfree(changed);
+
 	SPI_finish();
 
 	UnlockSharedObject(DatabaseRelationId, db_oid, 0, AccessShareLock);
-
-	if (changed)
-		pfree(changed);
 
 	if (base_digests)
 	{

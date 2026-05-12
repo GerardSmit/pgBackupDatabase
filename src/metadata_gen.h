@@ -5,13 +5,18 @@
 #include "lib/stringinfo.h"
 
 extern StringInfo metadata_gen_extensions(Oid db_oid);
+extern StringInfo metadata_gen_roles(Oid db_oid);
 extern StringInfo metadata_gen_schemas(Oid db_oid);
 extern StringInfo metadata_gen_db_grants(Oid db_oid);
 extern StringInfo metadata_gen_default_acls(Oid db_oid);
+extern StringInfo metadata_gen_object_owners(Oid db_oid);
 extern StringInfo metadata_gen_object_grants(Oid db_oid);
 extern StringInfo metadata_gen_comments(Oid db_oid);
 extern StringInfo metadata_gen_db_settings(Oid db_oid);
+extern StringInfo metadata_gen_sequence_values(Oid db_oid);
 extern StringInfo metadata_gen_timescaledb(Oid db_oid);
+extern StringInfo metadata_gen_large_objects(Oid db_oid);
+extern StringInfo metadata_gen_log_tail(Oid db_oid);
 extern StringInfo metadata_gen_all(Oid db_oid);
 
 #endif

@@ -29,13 +29,17 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
+        var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, "17");
+
         _container = new PostgreSqlBuilder()
-            .WithImage(PostgresImage)
+            .WithImage(image)
             .WithUsername(PostgresUser)
             .WithPassword(PostgresPassword)
             .WithDatabase(PostgresDb)
             .WithCommand(
-                "-c", "wal_level=replica",
+                "-c", "shared_preload_libraries=pg_dbbackup",
+                "-c", "wal_level=logical",
+                "-c", "max_replication_slots=100",
                 "-c", "track_commit_timestamp=on",
                 "-c", "max_wal_senders=5",
                 "-c", "wal_keep_size=64",
@@ -46,10 +50,6 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
         await _container.StartAsync();
         await WaitForReadyConnectionAsync();
-        await InstallBuildDepsAsync();
-        await CopySourceAsync();
-        await BuildAndInstallAsync();
-        await CopyExtensionMetadataAsync();
         await EnsureExtensionInPostgresDbAsync();
     }
 

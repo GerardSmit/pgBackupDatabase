@@ -1,0 +1,21 @@
+ARG BASE_IMAGE=postgres:17
+ARG PG_MAJOR=17
+
+FROM ${BASE_IMAGE}
+
+ARG PG_MAJOR=17
+
+RUN apt-get update -qq \
+	&& apt-get install -y -qq --no-install-recommends \
+		postgresql-server-dev-${PG_MAJOR} \
+		build-essential \
+		libzstd-dev \
+		libssl-dev \
+	&& rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Makefile pg_dbbackup.control ./
+COPY src ./src
+COPY sql ./sql
+
+RUN make -j"$(nproc)" && make install

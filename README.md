@@ -18,9 +18,13 @@ optionally encrypted, portable across machines via one file per backup.
 
 This is a v1. The SIMPLE recovery model is feature-complete and fully
 round-trips on stock heap tables, indexes, and most extensions
-(pgvector, pg_textsearch). The FULL recovery model captures files and
-WAL but **does not run a true WAL redo pass in-process** during restore
-— see *Known limitations* below.
+(pgvector, pg_textsearch). The FULL recovery model is now per-database
+logical PITR: a FULL backup stores schema plus binary `COPY` table data,
+and DIFFERENTIAL/LOG backups store a database-scoped logical decoding
+stream produced by the `pg_dbbackup` output plugin. Normal FULL-mode
+backups do not include raw WAL segments, `global/`, SLRU directories, or
+`pg_control`. DDL, sequence state, large objects, and TimescaleDB adapter
+state are represented logically in the v1 backup chain.
 
 ## Installation
 
@@ -51,9 +55,35 @@ This installs the shared library next to other PG modules and copies
 
 ### Cluster configuration
 
-`pg_dbbackup` requires the cluster to be running with `wal_level =
-replica` (or higher). Both SIMPLE and FULL modes rely on WAL records
-being present.
+`pg_dbbackup` FULL mode requires:
+
+- `shared_preload_libraries = 'pg_dbbackup'` (plus any extension preload
+  libraries such as `timescaledb`)
+- `wal_level = logical`
+- enough `max_replication_slots` for the databases/chains being backed up
+- enough WAL retention for the logical slots to remain healthy
+
+FULL-mode chain slots are created as PostgreSQL failover logical slots. In an
+HA cluster, connect backup/restore jobs directly to the current primary. To
+continue a LOG/DIFFERENTIAL chain after promotion, configure PostgreSQL 17+
+logical slot synchronization for the standby: a physical replication slot,
+`hot_standby_feedback = on`, `sync_replication_slots = on` on the standby, and
+`synchronized_standby_slots` on the primary for the standby's physical slot.
+Before planned promotion, run
+`dbbackup.pg_dbbackup_failover_slot_ready('<db>')` on the candidate standby.
+It must return `true`; a synced but temporary slot does not survive promotion.
+If a promoted primary does not have a persistent synced `_pg_dbbackup_<dboid>`
+slot, LOG/DIFFERENTIAL backup refuses to continue and you must take a new FULL
+backup.
+
+When using PgDog or another SQL proxy, backup jobs must be routed to the
+primary endpoint. `pg_dbbackup` does not reroute a request that reaches a hot
+standby; PostgreSQL rejects the write/slot work there. PgDog primary routing is
+tested, and a PgDog route pointed at the standby is expected to fail instead of
+silently forwarding the backup.
+
+SIMPLE mode does not need logical decoding, but using the same preload setting
+in test/dev clusters is fine.
 
 ### Enable in a database
 
@@ -89,7 +119,7 @@ SELECT dbbackup.pg_dbbackup(
     password := 's3cret');                       -- optional AES-256-GCM
 ```
 
-### 3. Take a DIFFERENTIAL (cumulative since the FULL)
+### 3. Take a DIFFERENTIAL (logical stream since the FULL)
 
 ```sql
 SELECT dbbackup.pg_dbbackup(
@@ -99,7 +129,7 @@ SELECT dbbackup.pg_dbbackup(
     base_filepath := '/var/backups/app-2026-05-11-full.bak');
 ```
 
-### 4. Take a LOG backup (FULL mode only; WAL-only, no data files)
+### 4. Take a LOG backup (FULL mode only; logical stream, no data files)
 
 ```sql
 SELECT dbbackup.pg_dbbackup(
@@ -149,72 +179,65 @@ SELECT * FROM dbbackup.pg_dbbackup_verify('/var/backups/app-...-full.bak');
 
 | Capability                       | SIMPLE                       | FULL                                  |
 |----------------------------------|------------------------------|---------------------------------------|
-| Backup payload                   | DDL + `COPY` binary          | Database file images + filtered WAL   |
+| Backup payload                   | DDL + `COPY` binary          | DDL + `COPY` base + logical streams   |
 | `FULL` backups                   | Yes                          | Yes                                   |
-| `DIFFERENTIAL` (cumulative)      | Yes (re-dumps changed tables)| Yes (mtime-changed files + WAL range) |
-| `LOG`                            | No                           | Yes (WAL only)                        |
-| Point-in-time restore (`stop_at`)| No                           | Limited (scaffolded, see below)       |
-| Cross-PG-version restore         | Yes                          | No                                    |
+| `DIFFERENTIAL` (cumulative)      | Yes (re-dumps changed tables)| Yes (logical stream since base)       |
+| `LOG`                            | No                           | Yes (logical stream only)             |
+| Point-in-time restore (`stop_at`)| No                           | Yes, via logical transaction replay   |
+| Cross-PG-version restore         | Yes                          | Same supported PG majors tested       |
 | zstd compression                 | Yes                          | Yes                                   |
 | AES-256-GCM encryption           | Yes                          | Yes                                   |
-| Online (no exclusive locks)      | Yes                          | Yes (`do_pg_backup_start/stop`)       |
-| Per-database isolation           | Yes                          | Yes (WAL filtered by `dbOid`)         |
+| Online                           | Yes                          | Yes; FULL takes table `SHARE` locks   |
+| Per-database isolation           | Yes                          | Yes; logical slots are DB-scoped      |
 | Replaces existing target DB      | Yes (FORCE-drop + RENAME)    | Yes (FORCE-drop + RENAME)             |
 
 ## Known limitations
 
-- **No in-process WAL replay.** FULL-mode restore injects the captured
-  file images and parses the WAL stream for structure / PITR cutoffs,
-  but does **not** apply WAL records during restore. The pragmatic
-  workaround is to `VACUUM FREEZE; CHECKPOINT` the source database
-  before a FULL-mode backup; this is what the round-trip tests do.
-  See the header comment of `src/wal_replay.c` for the three viable
-  paths to real replay.
-- **Subprocess PITR scaffolding present, blocked by cluster-vs-DB scope
-  mismatch.** A subprocess-recovery path (`src/subprocess_recovery.c`)
-  drives `initdb` + `pg_ctl` against a synthetic PGDATA built from the
-  FULL backup's files plus captured WAL segments
-  (`BAKSECTION_WAL_SEGMENTS`). The synthetic cluster starts and begins
-  archive recovery, but recovery fails with *"WAL file is from
-  different database system"* because PG's redo is cluster-scoped: WAL
-  segments carry the source cluster's sysid while initdb assigned a
-  fresh sysid. Injecting the source's `pg_control` resolves the sysid
-  but then the synthetic `pg_database` (a shared catalog) has no row
-  for the source's `db_oid`, so we cannot connect to the recovered DB
-  to `pg_dump`. A complete fix needs one of: (a) capture the entire
-  cluster's `global/` shared catalogs at backup time — eliminates the
-  per-DB advantage, or (b) public SQL API for `CREATE DATABASE` with a
-  chosen OID matching `src_dboid` — none in PG17. The infrastructure
-  is in place for future work; today's PITR remains partial.
-- **PITR (`stop_at`) is partial.** The chain is scanned for the cutoff
-  commit, but because records aren't applied, restored state reflects
-  the chain-end on-disk image rather than the pre-cutoff state. A
-  `stop_at` past every commit succeeds; one inside the window emits a
-  `NOTICE` but cannot rewind.
-- **FULL-mode DIFFERENTIAL uses mtime-based change detection.** It is
-  conservative (no false negatives), not block-level. PG17's
-  `pg_wal_summary` infrastructure is a future enhancement.
-- **Inject step skips `global/` and tablespaces.** Per-DB restore only
-  rewrites `base/<dboid>/...`. Cluster-wide files
-  (`pg_filenode.map`, tablespaces) are captured in the `.bak` but not
-  re-injected on restore.
-- **TimescaleDB SIMPLE round-trip is not supported.** Hypertable chunks
-  live as plain tables but their `_timescaledb_catalog` metadata is
-  extension-owned and re-initialised empty on `CREATE EXTENSION`
-  during restore. Backup succeeds; restore leaves orphaned chunk
-  tables. Reconciliation is out of scope for v1.
+- **FULL-mode UPDATE/DELETE requires replica identity.** User tables
+  must have a primary key or `REPLICA IDENTITY FULL`; otherwise FULL
+  backup rejects the database before creating a misleading chain.
+- **FULL mode requires preload.** `pg_dbbackup` must be present in
+  `shared_preload_libraries` so transaction-end journals for sequences and
+  large objects run in writer backends.
+- **FULL-mode chain slots are failover-enabled.** PostgreSQL can synchronize
+  those slots to standbys when the cluster is configured for logical slot
+  synchronization. `pg_dbbackup_failover_slot_status`,
+  `pg_dbbackup_failover_slot_ready`, and
+  `pg_dbbackup_wait_failover_slot_ready` expose whether a candidate standby has
+  a persistent synced slot. LOG/DIFFERENTIAL backup refuses to continue if the
+  chain slot is missing, temporary, invalidated, or recreated without failover
+  support.
+- **PgDog/proxy backup routes must target primary.** Backup through a PgDog
+  primary route is tested. A route that reaches a standby fails; the extension
+  deliberately does not proxy the request to primary from inside PostgreSQL.
+- **DDL is captured through event triggers.** The v1 path journals
+  `ddl_command_end` and `sql_drop` command text and replays it in logical
+  transaction order. Newly found DDL command families should get tests or an
+  explicit rejection path.
+- **Sequences are journaled.** FULL captures sequence state and LOG replay
+  applies the latest `setval` at or before `stop_at`.
+- **Large objects are supported.** FULL captures large-object metadata/pages;
+  LOG captures changed snapshots and unlink behavior.
+- **TimescaleDB coverage includes adapter replay.** Hypertables,
+  multidimensional dimensions, chunk DML through the root hypertable,
+  continuous aggregates, retention policies, compression policies, refresh
+  policies, extension version preservation, chunk creation during LOG replay,
+  and `stop_at` filtering are tested.
 - **Foreground only.** Backups run inline in the calling backend.
   There is no background-worker variant. Plan accordingly for very
   large databases.
-- **Sections are buffered in memory.** Per-section streaming compression
-  and encryption work, but the section payload is built in a
-  `StringInfo` before flush. A future streaming variant would lift
-  the practical size ceiling.
+- **Compressed/encrypted sections are buffered in memory.** Plain sections
+  stream directly to disk, and FULL restore streams DATA entries into
+  `COPY FROM` in chunks. zstd/AES sections are still processed as whole
+  section blobs, and the footer checksum currently rereads the finished
+  `.bak`.
 
 ## Tests
 
-The test suite runs against a Postgres 17 container that builds and
-installs the extension from source.
+The test suite builds cached Docker images that already contain the
+compiled extension, then starts containers from those images. The first
+run after source changes rebuilds the final Docker layer; repeated runs
+reuse the image and avoid `apt-get`/`make` during fixture startup.
 
 ```bash
 cd tests/pg_dbbackup.Tests
@@ -222,8 +245,8 @@ dotnet run --project . -- --no-progress
 ```
 
 Requirements:
-- .NET 9 SDK
-- Docker (the test fixture uses `docker cp` and Testcontainers)
+- .NET SDK
+- Docker with BuildKit-compatible `docker build`
 
 The extension-compatibility tests
 (`PgvectorTests`, `PgTextsearchTests`, `TimescaleDbTests`,
