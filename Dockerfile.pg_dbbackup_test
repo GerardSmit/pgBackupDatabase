@@ -11,6 +11,7 @@ RUN apt-get update -qq \
 		build-essential \
 		libzstd-dev \
 		libssl-dev \
+		libcurl4-openssl-dev \
 	&& rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build

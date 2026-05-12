@@ -29,6 +29,7 @@
 #include "pg_dbbackup.h"
 
 PG_FUNCTION_INFO_V1(pg_dbbackup_async);
+PG_FUNCTION_INFO_V1(pg_dbbackup_to_storage_async);
 PG_FUNCTION_INFO_V1(pg_dbbackup_wait);
 
 #define ASYNC_BGW_LIB "pg_dbbackup"
@@ -108,14 +109,68 @@ insert_pending_job(const pg_uuid_t *id, const char *dbname,
 	SPI_connect();
 	ret = SPI_execute_with_args(
 		"INSERT INTO dbbackup.backup_jobs "
-		"  (backup_id, dbname, filepath, type, compress, has_password, "
+		"  (backup_id, dbname, destination, filepath, type, compress, has_password, "
 		"   requester_pid, base_filepath, status, progress) "
-		"VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending', 0)",
+		"VALUES ($1, $2, 'file', $3, $4, $5, $6, $7, $8, 'pending', 0)",
 		8, argtypes, values, nulls, false, 0);
 	if (ret != SPI_OK_INSERT)
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to insert backup job row (SPI %d)", ret)));
+	SPI_finish();
+}
+
+static void
+insert_pending_storage_job(const pg_uuid_t *id, const char *dbname,
+						   const char *type, const char *storage_target,
+						   const char *backup_set, bool compress,
+						   const pg_uuid_t *base_backup_id)
+{
+	Oid			argtypes[9] = {UUIDOID, TEXTOID, TEXTOID, TEXTOID,
+							   TEXTOID, BOOLOID, INT4OID, UUIDOID, BOOLOID};
+	Datum		values[9];
+	char		nulls[9] = {' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' '};
+	int			ret;
+
+	values[0] = UUIDPGetDatum(id);
+	values[1] = CStringGetTextDatum(dbname);
+	values[2] = CStringGetTextDatum(type);
+	if (storage_target)
+		values[3] = CStringGetTextDatum(storage_target);
+	else
+	{
+		values[3] = (Datum) 0;
+		nulls[3] = 'n';
+	}
+	if (backup_set)
+		values[4] = CStringGetTextDatum(backup_set);
+	else
+	{
+		values[4] = (Datum) 0;
+		nulls[4] = 'n';
+	}
+	values[5] = BoolGetDatum(compress);
+	values[6] = Int32GetDatum((int32) MyProcPid);
+	if (base_backup_id)
+		values[7] = UUIDPGetDatum(base_backup_id);
+	else
+	{
+		values[7] = (Datum) 0;
+		nulls[7] = 'n';
+	}
+	values[8] = BoolGetDatum(false);
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"INSERT INTO dbbackup.backup_jobs "
+		"  (backup_id, dbname, destination, type, storage_target, backup_set, "
+		"   compress, requester_pid, base_backup_id, has_password, status, progress) "
+		"VALUES ($1, $2, 'storage', $3, $4, $5, $6, $7, $8, $9, 'pending', 0)",
+		9, argtypes, values, nulls, false, 0);
+	if (ret != SPI_OK_INSERT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to insert storage backup job row (SPI %d)", ret)));
 	SPI_finish();
 }
 
@@ -192,6 +247,73 @@ pg_dbbackup_async(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 				 errmsg("could not register pg_dbbackup async worker"),
+				 errhint("Increase max_worker_processes or wait for existing workers to finish.")));
+	}
+
+	pfree(handle);
+
+	result_id = (pg_uuid_t *) palloc(sizeof(pg_uuid_t));
+	*result_id = backup_id;
+	PG_RETURN_POINTER(result_id);
+}
+
+Datum
+pg_dbbackup_to_storage_async(PG_FUNCTION_ARGS)
+{
+	text	   *dbname_text = PG_GETARG_TEXT_PP(0);
+	text	   *type_text = PG_GETARG_TEXT_PP(1);
+	char	   *storage_target = PG_ARGISNULL(2) ? NULL :
+		text_to_cstring(PG_GETARG_TEXT_PP(2));
+	char	   *backup_set = PG_ARGISNULL(3) ? NULL :
+		text_to_cstring(PG_GETARG_TEXT_PP(3));
+	bool		do_compress = PG_GETARG_BOOL(4);
+	pg_uuid_t  *base_backup_id = PG_ARGISNULL(5) ? NULL : PG_GETARG_UUID_P(5);
+	char	   *dbname = text_to_cstring(dbname_text);
+	char	   *type_str = text_to_cstring(type_text);
+	Oid			db_oid;
+	pg_uuid_t	backup_id;
+	BackgroundWorker worker;
+	BackgroundWorkerHandle *handle;
+	AsyncWorkerPayload payload;
+	pg_uuid_t  *result_id;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to perform backups")));
+
+	(void) parse_backup_type_arg(type_str);
+
+	db_oid = get_database_oid(dbname, false);
+	backup_id = generate_backup_uuid();
+
+	insert_pending_storage_job(&backup_id, dbname, type_str, storage_target,
+							   backup_set, do_compress, base_backup_id);
+
+	memset(&worker, 0, sizeof(worker));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	strlcpy(worker.bgw_library_name, ASYNC_BGW_LIB, BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, ASYNC_BGW_FN, BGW_MAXLEN);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_dbbackup async S3 backup");
+	snprintf(worker.bgw_type, BGW_MAXLEN, "pg_dbbackup");
+	worker.bgw_notify_pid = MyProcPid;
+	worker.bgw_main_arg = (Datum) 0;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.backup_id = backup_id;
+	payload.db_oid = db_oid;
+	payload.requester_pid = (int32) MyProcPid;
+	strlcpy(payload.dbname, dbname, sizeof(payload.dbname));
+	memcpy(worker.bgw_extra, &payload, sizeof(payload));
+
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+	{
+		mark_job_status_simple(&backup_id, "failed");
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_RESOURCES),
+				 errmsg("could not register pg_dbbackup storage async worker"),
 				 errhint("Increase max_worker_processes or wait for existing workers to finish.")));
 	}
 
@@ -347,8 +469,10 @@ worker_dispatch_backup(const AsyncWorkerPayload *payload,
 
 static void
 worker_load_job(const pg_uuid_t *id,
-				char **filepath_out, char **type_out,
-				bool *compress_out, char **base_filepath_out)
+				char **destination_out, char **filepath_out, char **type_out,
+				bool *compress_out, char **base_filepath_out,
+				char **storage_target_out, char **backup_set_out,
+				char **base_backup_id_out)
 {
 	Oid			argtypes[1] = {UUIDOID};
 	Datum		values[1];
@@ -356,15 +480,20 @@ worker_load_job(const pg_uuid_t *id,
 	MemoryContext oldcxt;
 	char	   *fp;
 	char	   *tp;
+	char	   *dest;
 	bool		comp;
 	char	   *bp = NULL;
+	char	   *st = NULL;
+	char	   *bs = NULL;
+	char	   *bb = NULL;
 	Datum		d;
 
 	values[0] = UUIDPGetDatum(id);
 
 	SPI_connect();
 	SPI_execute_with_args(
-		"SELECT filepath, type, compress, base_filepath "
+		"SELECT destination, filepath, type, compress, base_filepath, "
+		"       storage_target, backup_set, base_backup_id::text "
 		"  FROM dbbackup.backup_jobs WHERE backup_id = $1",
 		1, argtypes, values, NULL, true, 1);
 	if (SPI_processed == 0)
@@ -378,26 +507,45 @@ worker_load_job(const pg_uuid_t *id,
 	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
 
 	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull);
-	fp = pstrdup(TextDatumGetCString(d));
+	dest = pstrdup(TextDatumGetCString(d));
 
 	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull);
-	tp = pstrdup(TextDatumGetCString(d));
+	fp = isnull ? NULL : pstrdup(TextDatumGetCString(d));
 
 	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3, &isnull);
-	comp = DatumGetBool(d);
+	tp = pstrdup(TextDatumGetCString(d));
 
 	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
+	comp = DatumGetBool(d);
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
 	if (!isnull)
 		bp = pstrdup(TextDatumGetCString(d));
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
+	if (!isnull)
+		st = pstrdup(TextDatumGetCString(d));
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 7, &isnull);
+	if (!isnull)
+		bs = pstrdup(TextDatumGetCString(d));
+
+	d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 8, &isnull);
+	if (!isnull)
+		bb = pstrdup(TextDatumGetCString(d));
 
 	MemoryContextSwitchTo(oldcxt);
 
 	SPI_finish();
 
+	*destination_out = dest;
 	*filepath_out = fp;
 	*type_out = tp;
 	*compress_out = comp;
 	*base_filepath_out = bp;
+	*storage_target_out = st;
+	*backup_set_out = bs;
+	*base_backup_id_out = bb;
 }
 
 static void
@@ -459,14 +607,71 @@ worker_mark_failed(const pg_uuid_t *id, const char *err)
 	SPI_finish();
 }
 
+static void
+worker_dispatch_storage_backup(const AsyncWorkerPayload *payload,
+							   const char *type_str, bool compress,
+							   const char *storage_target,
+							   const char *backup_set,
+							   const char *base_backup_id)
+{
+	Oid			argtypes[6] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID,
+							   BOOLOID, TEXTOID};
+	Datum		values[6];
+	char		nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
+	int			ret;
+
+	values[0] = CStringGetTextDatum(payload->dbname);
+	values[1] = CStringGetTextDatum(type_str);
+	if (storage_target)
+		values[2] = CStringGetTextDatum(storage_target);
+	else
+	{
+		values[2] = (Datum) 0;
+		nulls[2] = 'n';
+	}
+	if (backup_set)
+		values[3] = CStringGetTextDatum(backup_set);
+	else
+	{
+		values[3] = (Datum) 0;
+		nulls[3] = 'n';
+	}
+	values[4] = BoolGetDatum(compress);
+	if (base_backup_id)
+		values[5] = CStringGetTextDatum(base_backup_id);
+	else
+	{
+		values[5] = (Datum) 0;
+		nulls[5] = 'n';
+	}
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"SELECT dbbackup.pg_dbbackup_to_storage("
+		"  dbname := $1, type := $2, storage_target := $3, backup_set := $4, "
+		"  compress := $5, base_backup_id := $6::uuid)",
+		6, argtypes, values, nulls, false, 1);
+	SPI_finish();
+
+	if (ret != SPI_OK_SELECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("storage backup worker failed to dispatch backup (SPI %d)",
+						ret)));
+}
+
 void
 pgbu_async_worker_main(Datum main_arg)
 {
 	AsyncWorkerPayload payload;
+	char	   *destination = NULL;
 	char	   *filepath = NULL;
 	char	   *type_str = NULL;
 	bool		compress = false;
 	char	   *base_filepath = NULL;
+	char	   *storage_target = NULL;
+	char	   *backup_set = NULL;
+	char	   *base_backup_id = NULL;
 	bool		failed = false;
 	char	   *fail_msg = NULL;
 	MemoryContext worker_cxt;
@@ -525,7 +730,9 @@ pgbu_async_worker_main(Datum main_arg)
 	StartTransactionCommand();
 	PushActiveSnapshot(GetTransactionSnapshot());
 	worker_load_job(&payload.backup_id,
-					&filepath, &type_str, &compress, &base_filepath);
+					&destination, &filepath, &type_str, &compress,
+					&base_filepath, &storage_target, &backup_set,
+					&base_backup_id);
 	worker_mark_running(&payload.backup_id);
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -534,8 +741,13 @@ pgbu_async_worker_main(Datum main_arg)
 	{
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
-		worker_dispatch_backup(&payload, filepath, type_str, compress,
-							   NULL, base_filepath);
+		if (destination && strcmp(destination, "storage") == 0)
+			worker_dispatch_storage_backup(&payload, type_str, compress,
+										   storage_target, backup_set,
+										   base_backup_id);
+		else
+			worker_dispatch_backup(&payload, filepath, type_str, compress,
+								   NULL, base_filepath);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 	}

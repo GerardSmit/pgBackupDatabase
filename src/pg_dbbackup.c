@@ -6,8 +6,10 @@
 #include "executor/spi.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -26,6 +28,11 @@
 PG_MODULE_MAGIC;
 
 void _PG_init(void);
+void pgbu_scheduler_worker_main(Datum main_arg);
+
+bool		pgdb_scheduler_enabled = true;
+char	   *pgdb_scheduler_database = NULL;
+int			pgdb_scheduler_interval_ms = 60000;
 
 PG_FUNCTION_INFO_V1(pg_dbbackup_set_mode);
 PG_FUNCTION_INFO_V1(pg_dbbackup_get_mode);
@@ -41,7 +48,63 @@ PG_FUNCTION_INFO_V1(pg_dbbackup_test_ddl);
 void
 _PG_init(void)
 {
+	DefineCustomBoolVariable(
+		"dbbackup.scheduler_enabled",
+		"Runs the pg_dbbackup schedule dispatcher background worker.",
+		NULL,
+		&pgdb_scheduler_enabled,
+		true,
+		PGC_POSTMASTER,
+		0,
+		NULL,
+		NULL,
+		NULL);
+
+	DefineCustomStringVariable(
+		"dbbackup.scheduler_database",
+		"Database containing pg_dbbackup storage targets, backup sets, and schedules.",
+		NULL,
+		&pgdb_scheduler_database,
+		"postgres",
+		PGC_POSTMASTER,
+		0,
+		NULL,
+		NULL,
+		NULL);
+
+	DefineCustomIntVariable(
+		"dbbackup.scheduler_interval_ms",
+		"Interval between pg_dbbackup scheduler wakeups.",
+		NULL,
+		&pgdb_scheduler_interval_ms,
+		60000,
+		1000,
+		3600000,
+		PGC_SIGHUP,
+		0,
+		NULL,
+		NULL,
+		NULL);
+
 	pgdb_logical_journal_init(process_shared_preload_libraries_in_progress);
+
+	if (process_shared_preload_libraries_in_progress &&
+		pgdb_scheduler_enabled)
+	{
+		BackgroundWorker worker;
+
+		memset(&worker, 0, sizeof(worker));
+		worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
+			BGWORKER_BACKEND_DATABASE_CONNECTION;
+		worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+		worker.bgw_restart_time = 60;
+		strlcpy(worker.bgw_library_name, "pg_dbbackup", BGW_MAXLEN);
+		strlcpy(worker.bgw_function_name, "pgbu_scheduler_worker_main",
+				BGW_MAXLEN);
+		snprintf(worker.bgw_name, BGW_MAXLEN, "pg_dbbackup scheduler");
+		snprintf(worker.bgw_type, BGW_MAXLEN, "pg_dbbackup");
+		RegisterBackgroundWorker(&worker);
+	}
 }
 
 /*

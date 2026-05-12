@@ -746,6 +746,58 @@ advance_logical_slot_to_lsn(const char *slot_name, XLogRecPtr upto_lsn)
 	return confirmed_lsn;
 }
 
+void
+backup_full_finish_deferred_advance(Oid db_oid, const char *db_name,
+									PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL || advance->slot_name == NULL ||
+		XLogRecPtrIsInvalid(advance->stop_lsn))
+		return;
+
+	advance->stop_lsn = advance_logical_slot_to_lsn(advance->slot_name,
+													advance->stop_lsn);
+	upsert_logical_chain(db_oid, db_name, advance->slot_name,
+						 advance->stop_lsn);
+	if (advance->reset_journal)
+		pgdb_logical_journal_reset_state();
+	advance->drop_slot_on_abort = false;
+}
+
+void
+backup_full_abort_deferred_advance(PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL)
+		return;
+
+	if (advance->drop_slot_on_abort && advance->slot_name)
+	{
+		PG_TRY();
+		{
+			drop_replication_slot_if_exists(advance->slot_name);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+		}
+		PG_END_TRY();
+	}
+	backup_full_free_deferred_advance(advance);
+}
+
+void
+backup_full_free_deferred_advance(PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL)
+		return;
+
+	if (advance->slot_name)
+		pfree(advance->slot_name);
+	advance->slot_name = NULL;
+	advance->stop_lsn = InvalidXLogRecPtr;
+	advance->reset_journal = false;
+	advance->drop_slot_on_abort = false;
+}
+
 
 static uint32
 write_logical_stream_section(BakFileWriter *writer, const char *slot_name,
@@ -815,11 +867,15 @@ write_logical_stream_section(BakFileWriter *writer, const char *slot_name,
 	return frame_count;
 }
 
-void
-backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
-				 bool compress, const char *password)
+static void
+backup_full_full_common(Oid db_oid, const char *db_name, const char *filepath,
+						bool compress, const char *password,
+						PgDbBackupDeferredAdvance *advance_out)
 {
 	FILE	   *probe;
+
+	if (advance_out)
+		memset(advance_out, 0, sizeof(*advance_out));
 
 	if (!superuser())
 		ereport(ERROR,
@@ -866,9 +922,19 @@ backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
 				chain_lsn = slot_lsn;
 			backup_simple_full_as_mode_lsn(db_oid, db_name, filepath, compress,
 										   password, BACKUP_MODE_FULL, chain_lsn);
-			chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
-			upsert_logical_chain(db_oid, db_name, logical_slot, chain_lsn);
-			pgdb_logical_journal_reset_state();
+			if (advance_out)
+			{
+				advance_out->slot_name = pstrdup(logical_slot);
+				advance_out->stop_lsn = chain_lsn;
+				advance_out->reset_journal = true;
+				advance_out->drop_slot_on_abort = slot_created;
+			}
+			else
+			{
+				chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
+				upsert_logical_chain(db_oid, db_name, logical_slot, chain_lsn);
+				pgdb_logical_journal_reset_state();
+			}
 		}
 		PG_CATCH();
 		{
@@ -897,6 +963,26 @@ backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
 	ereport(NOTICE,
 			(errmsg("FULL backup of \"%s\" complete: logical snapshot written to \"%s\"",
 					db_name, filepath)));
+}
+
+void
+backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
+				 bool compress, const char *password)
+{
+	backup_full_full_common(db_oid, db_name, filepath, compress, password,
+							NULL);
+}
+
+void
+backup_full_full_deferred(Oid db_oid, const char *db_name,
+						  const char *filepath, bool compress,
+						  const char *password,
+						  PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL)
+		elog(ERROR, "deferred advance output is required");
+	backup_full_full_common(db_oid, db_name, filepath, compress, password,
+							advance);
 }
 
 static void
@@ -934,10 +1020,12 @@ read_base_header(const char *base_filepath, const char *password,
 	bakfile_close_reader(reader);
 }
 
-void
-backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
-						 const char *base_filepath, bool compress,
-						 const char *password)
+static void
+backup_full_differential_common(Oid db_oid, const char *db_name,
+								const char *filepath,
+								const char *base_filepath, bool compress,
+								const char *password,
+								PgDbBackupDeferredAdvance *advance_out)
 {
 	BakFileHeader header;
 	BakFileWriter *writer;
@@ -950,6 +1038,9 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 	TimeLineID	current_tli;
 	TimestampTz diff_created_at;
 	uint32		frame_count = 0;
+
+	if (advance_out)
+		memset(advance_out, 0, sizeof(*advance_out));
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1033,8 +1124,18 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 												   current_lsn);
 
 		bakfile_close(writer);
-		current_lsn = advance_logical_slot_to_lsn(slot_name, current_lsn);
-		upsert_logical_chain(db_oid, db_name, slot_name, current_lsn);
+		if (advance_out)
+		{
+			advance_out->slot_name = pstrdup(slot_name);
+			advance_out->stop_lsn = current_lsn;
+			advance_out->reset_journal = false;
+			advance_out->drop_slot_on_abort = false;
+		}
+		else
+		{
+			current_lsn = advance_logical_slot_to_lsn(slot_name, current_lsn);
+			upsert_logical_chain(db_oid, db_name, slot_name, current_lsn);
+		}
 	}
 	PG_CATCH();
 	{
@@ -1056,6 +1157,28 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 					LSN_FORMAT_ARGS(base_stop_lsn),
 					LSN_FORMAT_ARGS(current_lsn),
 					filepath)));
+}
+
+void
+backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
+						 const char *base_filepath, bool compress,
+						 const char *password)
+{
+	backup_full_differential_common(db_oid, db_name, filepath, base_filepath,
+									compress, password, NULL);
+}
+
+void
+backup_full_differential_deferred(Oid db_oid, const char *db_name,
+								  const char *filepath,
+								  const char *base_filepath,
+								  bool compress, const char *password,
+								  PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL)
+		elog(ERROR, "deferred advance output is required");
+	backup_full_differential_common(db_oid, db_name, filepath, base_filepath,
+									compress, password, advance);
 }
 
 static void
@@ -1098,9 +1221,11 @@ read_prev_backup_info(const char *prev_filepath, const char *password,
 	*prev_created_at_out = prev_created_at;
 }
 
-void
-backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
-				const char *prev_filepath, bool compress, const char *password)
+static void
+backup_full_log_common(Oid db_oid, const char *db_name, const char *filepath,
+					   const char *prev_filepath, bool compress,
+					   const char *password,
+					   PgDbBackupDeferredAdvance *advance_out)
 {
 	BakFileHeader header;
 	BakFileWriter *writer;
@@ -1113,6 +1238,9 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 	uint32		frame_count = 0;
 	char	   *logical_slot;
 	StringInfo	metadata_sql;
+
+	if (advance_out)
+		memset(advance_out, 0, sizeof(*advance_out));
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1191,8 +1319,18 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 												   current_lsn);
 
 		bakfile_close(writer);
-		current_lsn = advance_logical_slot_to_lsn(logical_slot, current_lsn);
-		upsert_logical_chain(db_oid, db_name, logical_slot, current_lsn);
+		if (advance_out)
+		{
+			advance_out->slot_name = pstrdup(logical_slot);
+			advance_out->stop_lsn = current_lsn;
+			advance_out->reset_journal = false;
+			advance_out->drop_slot_on_abort = false;
+		}
+		else
+		{
+			current_lsn = advance_logical_slot_to_lsn(logical_slot, current_lsn);
+			upsert_logical_chain(db_oid, db_name, logical_slot, current_lsn);
+		}
 	}
 	PG_CATCH();
 	{
@@ -1214,4 +1352,24 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 					LSN_FORMAT_ARGS(prev_stop_lsn),
 					LSN_FORMAT_ARGS(current_lsn),
 					filepath)));
+}
+
+void
+backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
+				const char *prev_filepath, bool compress, const char *password)
+{
+	backup_full_log_common(db_oid, db_name, filepath, prev_filepath,
+						   compress, password, NULL);
+}
+
+void
+backup_full_log_deferred(Oid db_oid, const char *db_name,
+						 const char *filepath, const char *prev_filepath,
+						 bool compress, const char *password,
+						 PgDbBackupDeferredAdvance *advance)
+{
+	if (advance == NULL)
+		elog(ERROR, "deferred advance output is required");
+	backup_full_log_common(db_oid, db_name, filepath, prev_filepath,
+						   compress, password, advance);
 }

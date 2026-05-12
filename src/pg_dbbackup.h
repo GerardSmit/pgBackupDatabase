@@ -20,5 +20,8 @@ typedef enum PgDbBackupType
 } PgDbBackupType;
 
 extern PgDbBackupMode pg_dbbackup_resolve_mode(Oid db_oid);
+extern bool pgdb_scheduler_enabled;
+extern char *pgdb_scheduler_database;
+extern int pgdb_scheduler_interval_ms;
 
 #endif /* PG_DBBACKUP_H */
