@@ -12,6 +12,7 @@
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
 
@@ -253,6 +254,13 @@ logical_slot_name_for_db(Oid db_oid)
 	return psprintf("_pg_dbbackup_%u", db_oid);
 }
 
+static void
+format_lsn(XLogRecPtr lsn, char *buf, size_t buflen)
+{
+	snprintf(buf, buflen, "%X/%X",
+			 (uint32) (lsn >> 32), (uint32) lsn);
+}
+
 static bool
 parse_lsn_text(const char *s, XLogRecPtr *lsn_out)
 {
@@ -264,6 +272,36 @@ parse_lsn_text(const char *s, XLogRecPtr *lsn_out)
 
 	*lsn_out = ((XLogRecPtr) hi << 32) | lo;
 	return true;
+}
+
+static bool
+logical_replication_slot_exists(const char *slot_name)
+{
+	int			ret;
+	bool		exists;
+	bool		isnull;
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"SELECT EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)",
+		1,
+		(Oid[]){TEXTOID},
+		(Datum[]){CStringGetTextDatum(slot_name)},
+		NULL, true, 1);
+
+	if (ret != SPI_OK_SELECT || SPI_processed != 1)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not inspect replication slot \"%s\" (rc=%d)",
+						slot_name, ret)));
+	}
+
+	exists = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+										SPI_tuptable->tupdesc, 1, &isnull));
+	SPI_finish();
+	return exists;
 }
 
 static void
@@ -371,8 +409,6 @@ create_logical_slot_for_db(const char *slot_name)
 	int			ret;
 	XLogRecPtr	lsn;
 
-	drop_replication_slot_if_exists(slot_name);
-
 	SPI_connect();
 	ret = SPI_execute_with_args(
 		"SELECT lsn::text FROM "
@@ -402,6 +438,106 @@ create_logical_slot_for_db(const char *slot_name)
 
 	SPI_finish();
 	return lsn;
+}
+
+static bool
+lookup_logical_chain(Oid db_oid, char **slot_name_out,
+					 XLogRecPtr *confirmed_lsn_out)
+{
+	int			ret;
+	char	   *slot_text;
+	char	   *lsn_text;
+	MemoryContext caller_ctx = CurrentMemoryContext;
+
+	if (slot_name_out)
+		*slot_name_out = NULL;
+	if (confirmed_lsn_out)
+		*confirmed_lsn_out = InvalidXLogRecPtr;
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"SELECT slot_name::text, confirmed_lsn::text "
+		"FROM dbbackup.logical_chains "
+		"WHERE db_oid = $1",
+		1,
+		(Oid[]){OIDOID},
+		(Datum[]){ObjectIdGetDatum(db_oid)},
+		NULL, true, 1);
+
+	if (ret != SPI_OK_SELECT)
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not inspect logical PITR chain metadata (rc=%d)",
+						ret)));
+	}
+
+	if (SPI_processed == 0)
+	{
+		SPI_finish();
+		return false;
+	}
+
+	slot_text = SPI_getvalue(SPI_tuptable->vals[0],
+							 SPI_tuptable->tupdesc, 1);
+	lsn_text = SPI_getvalue(SPI_tuptable->vals[0],
+							SPI_tuptable->tupdesc, 2);
+
+	if (slot_text == NULL || lsn_text == NULL ||
+		!parse_lsn_text(lsn_text, confirmed_lsn_out))
+	{
+		SPI_finish();
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("logical PITR chain metadata is corrupt")));
+	}
+
+	if (slot_name_out)
+	{
+		MemoryContext old_ctx = MemoryContextSwitchTo(caller_ctx);
+
+		*slot_name_out = pstrdup(slot_text);
+		MemoryContextSwitchTo(old_ctx);
+	}
+
+	SPI_finish();
+	return true;
+}
+
+static char *
+active_chain_slot_for_previous_backup(Oid db_oid, const char *db_name,
+									  XLogRecPtr previous_stop_lsn,
+									  const char *backup_type)
+{
+	char	   *slot_name;
+	XLogRecPtr	confirmed_lsn;
+
+	if (!lookup_logical_chain(db_oid, &slot_name, &confirmed_lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("no active FULL logical PITR chain for database \"%s\"",
+						db_name),
+				 errhint("Take a FULL backup before taking a %s backup.",
+						 backup_type)));
+
+	if (confirmed_lsn != previous_stop_lsn)
+	{
+		char		expected[64];
+		char		actual[64];
+
+		format_lsn(previous_stop_lsn, expected, sizeof(expected));
+		format_lsn(confirmed_lsn, actual, sizeof(actual));
+		pfree(slot_name);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("previous backup does not match the active logical PITR chain"),
+				 errdetail("Previous backup stops at %s, but the active chain is at %s.",
+						   expected, actual),
+				 errhint("Use the most recent backup in the chain, or take a new FULL backup.")));
+	}
+
+	return slot_name;
 }
 
 static void
@@ -561,8 +697,7 @@ advance_logical_slot_to_lsn(const char *slot_name, XLogRecPtr upto_lsn)
 	char	   *confirmed_text;
 	char		upto_lsn_buf[64];
 
-	snprintf(upto_lsn_buf, sizeof(upto_lsn_buf), "%X/%X",
-			 (uint32) (upto_lsn >> 32), (uint32) upto_lsn);
+	format_lsn(upto_lsn, upto_lsn_buf, sizeof(upto_lsn_buf));
 
 	SPI_connect();
 	ret = SPI_execute_with_args(
@@ -578,7 +713,7 @@ advance_logical_slot_to_lsn(const char *slot_name, XLogRecPtr upto_lsn)
 		SPI_finish();
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to prime logical PITR slot \"%s\" (rc=%d)",
+				 errmsg("failed to advance logical PITR slot \"%s\" (rc=%d)",
 						slot_name, ret)));
 	}
 
@@ -595,7 +730,7 @@ advance_logical_slot_to_lsn(const char *slot_name, XLogRecPtr upto_lsn)
 		SPI_finish();
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to inspect primed logical PITR slot \"%s\" (rc=%d)",
+				 errmsg("failed to inspect advanced logical PITR slot \"%s\" (rc=%d)",
 						slot_name, ret)));
 	}
 
@@ -622,15 +757,14 @@ write_logical_stream_section(BakFileWriter *writer, const char *slot_name,
 	char		lsn_buf[64];
 	uint32		net_frame_count;
 
-	snprintf(lsn_buf, sizeof(lsn_buf), "%X/%X",
-			 (uint32) (upto_lsn >> 32), (uint32) upto_lsn);
+	format_lsn(upto_lsn, lsn_buf, sizeof(lsn_buf));
 
 	SPI_connect();
 	ensure_logical_slot_failover_enabled(slot_name);
 
 	ret = SPI_execute_with_args(
 		"SELECT data "
-		"FROM pg_logical_slot_get_changes($1, $2::pg_lsn, NULL)",
+		"FROM pg_logical_slot_peek_changes($1, $2::pg_lsn, NULL)",
 		2,
 		(Oid[]){TEXTOID, TEXTOID},
 		(Datum[]){CStringGetTextDatum(slot_name),
@@ -704,23 +838,35 @@ backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
 	(void) unlink(filepath);
 
 	{
-		char	   *logical_slot = logical_slot_name_for_db(db_oid);
-		XLogRecPtr	slot_lsn;
+		char	   *logical_slot = NULL;
+		XLogRecPtr	slot_lsn = InvalidXLogRecPtr;
 		XLogRecPtr	chain_lsn;
+		XLogRecPtr	existing_confirmed_lsn;
 		bool		slot_created = false;
 
 		PG_TRY();
 		{
 			pgdb_logical_journal_set_suppressed(true);
 			lock_logical_full_tables(db_oid);
-			slot_lsn = create_logical_slot_for_db(logical_slot);
-			slot_created = true;
+
+			if (!lookup_logical_chain(db_oid, &logical_slot,
+									  &existing_confirmed_lsn) ||
+				!logical_replication_slot_exists(logical_slot))
+			{
+				if (logical_slot)
+					pfree(logical_slot);
+				logical_slot = logical_slot_name_for_db(db_oid);
+				drop_replication_slot_if_exists(logical_slot);
+				slot_lsn = create_logical_slot_for_db(logical_slot);
+				slot_created = true;
+			}
+
 			chain_lsn = emit_logical_flush_marker(false);
-			if (chain_lsn < slot_lsn)
+			if (!XLogRecPtrIsInvalid(slot_lsn) && chain_lsn < slot_lsn)
 				chain_lsn = slot_lsn;
-			chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
 			backup_simple_full_as_mode_lsn(db_oid, db_name, filepath, compress,
 										   password, BACKUP_MODE_FULL, chain_lsn);
+			chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
 			upsert_logical_chain(db_oid, db_name, logical_slot, chain_lsn);
 			pgdb_logical_journal_reset_state();
 		}
@@ -739,11 +885,14 @@ backup_full_full(Oid db_oid, const char *db_name, const char *filepath,
 				}
 				PG_END_TRY();
 			}
-			pfree(logical_slot);
+			if (logical_slot)
+				pfree(logical_slot);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
-		pfree(logical_slot);
+		pgdb_logical_journal_set_suppressed(false);
+		if (logical_slot)
+			pfree(logical_slot);
 	}
 	ereport(NOTICE,
 			(errmsg("FULL backup of \"%s\" complete: logical snapshot written to \"%s\"",
@@ -823,7 +972,9 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("base for differential must be type=full, got a different type")));
 
-	slot_name = logical_slot_name_for_db(db_oid);
+	slot_name = active_chain_slot_for_previous_backup(db_oid, db_name,
+													 base_stop_lsn,
+													 "DIFFERENTIAL");
 
 	probe = AllocateFile(filepath, "wb");
 	if (probe == NULL)
@@ -882,6 +1033,7 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 												   current_lsn);
 
 		bakfile_close(writer);
+		current_lsn = advance_logical_slot_to_lsn(slot_name, current_lsn);
 		upsert_logical_chain(db_oid, db_name, slot_name, current_lsn);
 	}
 	PG_CATCH();
@@ -892,6 +1044,7 @@ backup_full_differential(Oid db_oid, const char *db_name, const char *filepath,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	pgdb_logical_journal_set_suppressed(false);
 
 	pfree(slot_name);
 	UnlockSharedObject(DatabaseRelationId, db_oid, 0, AccessShareLock);
@@ -977,7 +1130,9 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 	read_prev_backup_info(prev_filepath, password, db_name,
 						  &prev_stop_lsn, &prev_created_at);
 	(void) prev_created_at;
-	logical_slot = logical_slot_name_for_db(db_oid);
+	logical_slot = active_chain_slot_for_previous_backup(db_oid, db_name,
+														prev_stop_lsn,
+														"LOG");
 
 	probe = AllocateFile(filepath, "wb");
 	if (probe == NULL)
@@ -1036,6 +1191,7 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 												   current_lsn);
 
 		bakfile_close(writer);
+		current_lsn = advance_logical_slot_to_lsn(logical_slot, current_lsn);
 		upsert_logical_chain(db_oid, db_name, logical_slot, current_lsn);
 	}
 	PG_CATCH();
@@ -1046,6 +1202,7 @@ backup_full_log(Oid db_oid, const char *db_name, const char *filepath,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	pgdb_logical_journal_set_suppressed(false);
 
 	pfree(logical_slot);
 	UnlockSharedObject(DatabaseRelationId, db_oid, 0, AccessShareLock);

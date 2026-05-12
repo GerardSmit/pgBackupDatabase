@@ -185,6 +185,104 @@ public sealed class FullBackupTests
     }
 
     [Fact]
+    public async Task Full_Log_Backup_Advances_Slot_To_Durable_Log_Stop_Lsn()
+    {
+        await using var conn = await _pg.CreateFreshDbWithExtensionAsync();
+        await conn.SetModeFullAsync();
+        await conn.ExecAsync(
+            "CREATE TABLE t(id int PRIMARY KEY, v text);" +
+            "INSERT INTO t VALUES (1, 'base');");
+
+        var fullPath = Helpers.BackupPath("full");
+        var logPath = Helpers.BackupPath("log");
+        await conn.BackupFullAsync(fullPath);
+
+        await conn.ExecAsync("INSERT INTO t VALUES (2, 'after-full');");
+        await conn.BackupLogAsync(logPath, fullPath);
+
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText =
+            "SELECT h.stop_lsn::text, c.confirmed_lsn::text, s.confirmed_flush_lsn::text " +
+            "FROM dbbackup.pg_dbbackup_header(@path) h " +
+            "JOIN dbbackup.logical_chains c ON c.db_oid = " +
+            "  (SELECT oid FROM pg_database WHERE datname = current_database()) " +
+            "JOIN pg_replication_slots s ON s.slot_name = c.slot_name";
+        cmd.Parameters.AddWithValue("path", logPath);
+
+        await using var reader = await cmd.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        var stopLsn = reader.GetString(0);
+        Assert.Equal(stopLsn, reader.GetString(1));
+        Assert.Equal(stopLsn, reader.GetString(2));
+    }
+
+    [Fact]
+    public async Task Full_Backup_Replaces_Chain_By_Advancing_Active_Slot()
+    {
+        await using var conn = await _pg.CreateFreshDbWithExtensionAsync();
+        await conn.SetModeFullAsync();
+        await conn.ExecAsync(
+            "CREATE TABLE t(id int PRIMARY KEY, v text);" +
+            "INSERT INTO t VALUES (1, 'base');");
+
+        var full1 = Helpers.BackupPath("full");
+        await conn.BackupFullAsync(full1);
+
+        await using var slotCmd = conn.CreateCommand();
+        slotCmd.CommandText =
+            "SELECT slot_name::text FROM dbbackup.logical_chains " +
+            "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())";
+        var slotBefore = (string)(await slotCmd.ExecuteScalarAsync())!;
+
+        await conn.ExecAsync("INSERT INTO t VALUES (2, 'after-first-full');");
+        var full2 = Helpers.BackupPath("full");
+        await conn.BackupFullAsync(full2);
+
+        await using var verify = conn.CreateCommand();
+        verify.CommandText =
+            "SELECT h.stop_lsn::text, c.slot_name::text, c.confirmed_lsn::text, " +
+            "       s.confirmed_flush_lsn::text, " +
+            "       (SELECT count(*) FROM pg_replication_slots WHERE slot_name = c.slot_name) " +
+            "FROM dbbackup.pg_dbbackup_header(@path) h " +
+            "JOIN dbbackup.logical_chains c ON c.db_oid = " +
+            "  (SELECT oid FROM pg_database WHERE datname = current_database()) " +
+            "JOIN pg_replication_slots s ON s.slot_name = c.slot_name";
+        verify.Parameters.AddWithValue("path", full2);
+
+        await using var reader = await verify.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        var stopLsn = reader.GetString(0);
+        Assert.Equal(slotBefore, reader.GetString(1));
+        Assert.Equal(stopLsn, reader.GetString(2));
+        Assert.Equal(stopLsn, reader.GetString(3));
+        Assert.Equal(1L, reader.GetInt64(4));
+    }
+
+    [Fact]
+    public async Task Full_Log_Backup_Rejects_Stale_Previous_Backup_After_Slot_Moves()
+    {
+        await using var conn = await _pg.CreateFreshDbWithExtensionAsync();
+        await conn.SetModeFullAsync();
+        await conn.ExecAsync(
+            "CREATE TABLE t(id int PRIMARY KEY, v text);" +
+            "INSERT INTO t VALUES (1, 'base');");
+
+        var fullPath = Helpers.BackupPath("full");
+        var log1 = Helpers.BackupPath("log");
+        var log2 = Helpers.BackupPath("log");
+        await conn.BackupFullAsync(fullPath);
+
+        await conn.ExecAsync("INSERT INTO t VALUES (2, 'after-full');");
+        await conn.BackupLogAsync(log1, fullPath);
+
+        await conn.ExecAsync("INSERT INTO t VALUES (3, 'after-log1');");
+        var ex = await Assert.ThrowsAsync<PostgresException>(async () =>
+            await conn.BackupLogAsync(log2, fullPath));
+        Assert.Contains("previous backup does not match the active logical PITR chain",
+            ex.MessageText);
+    }
+
+    [Fact]
     public async Task Full_Log_Backup_Rejects_NonFailover_Chain_Slot()
     {
         await using var conn = await _pg.CreateFreshDbWithExtensionAsync();

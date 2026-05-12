@@ -51,7 +51,7 @@ public sealed class FullRestoreChainTests
     }
 
     [Fact]
-    public async Task FullRestore_Rejects_Two_Diffs_In_Chain()
+    public async Task FullDiff_Rejects_Stale_Base_After_First_Diff_Moves_Slot()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -68,29 +68,10 @@ public sealed class FullRestoreChainTests
 
         await src.ExecAsync("INSERT INTO t VALUES (3,'three');");
         var diff2 = Helpers.BackupPath("chain");
-        await src.BackupDiffAsync(diff2, fullPath);
-        await src.CloseAsync();
-
-        var target = "chain_twodiffs_" + Guid.NewGuid().ToString("N")[..8];
-        try
-        {
-            await using var admin = await _pg.AdminAsync();
-            await using var cmd = admin.CreateCommand();
-            cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2, @p3]::text[], target_db := @tgt)";
-            cmd.Parameters.AddWithValue("db", "ignored");
-            cmd.Parameters.AddWithValue("p1", fullPath);
-            cmd.Parameters.AddWithValue("p2", diff1);
-            cmd.Parameters.AddWithValue("p3", diff2);
-            cmd.Parameters.AddWithValue("tgt", target);
-
-            await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
-        }
-        finally
-        {
-            try { await _pg.DropDbAsync(target); } catch { }
-        }
+        var ex = await Assert.ThrowsAsync<PostgresException>(async () =>
+            await src.BackupDiffAsync(diff2, fullPath));
+        Assert.Contains("previous backup does not match the active logical PITR chain",
+            ex.MessageText);
     }
 
     [Fact]
