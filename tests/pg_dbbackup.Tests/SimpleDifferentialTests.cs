@@ -117,7 +117,7 @@ public sealed class SimpleDifferentialTests
                 cmd.Parameters.AddWithValue("p2", diffPath);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 60;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -126,22 +126,22 @@ public sealed class SimpleDifferentialTests
             await using (var c = conn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM a";
-                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
             await using (var c = conn.CreateCommand())
             {
                 c.CommandText = "SELECT v FROM a WHERE id = 1";
-                Assert.Equal("a1-mod", (string)(await c.ExecuteScalarAsync())!);
+                Assert.Equal("a1-mod", (string)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
             await using (var c = conn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM b";
-                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
             await using (var c = conn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM c";
-                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -184,7 +184,7 @@ public sealed class SimpleDifferentialTests
             cmd.Parameters.AddWithValue("tgt", target);
 
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
         }
         finally
         {

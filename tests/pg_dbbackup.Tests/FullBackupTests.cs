@@ -108,7 +108,7 @@ public sealed class FullBackupTests
 
         var builder = new NpgsqlConnectionStringBuilder(_pg.ConnectionString) { Database = dbName };
         var inserter = new NpgsqlConnection(builder.ConnectionString);
-        await inserter.OpenAsync();
+        await inserter.OpenAsync(TestContext.Current.CancellationToken);
 
         var backupTask = conn.BackupFullAsync(path);
 
@@ -122,10 +122,10 @@ public sealed class FullBackupTests
                     cmd.CommandText =
                         $"INSERT INTO concur VALUES (1000 + {i}, 'cc{i}')";
                     cmd.CommandTimeout = 5;
-                    await cmd.ExecuteNonQueryAsync();
+                    await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
                 }
                 catch { /* tolerate */ }
-                await Task.Delay(50);
+                await Task.Delay(50, TestContext.Current.CancellationToken);
             }
         }
         finally
@@ -138,8 +138,8 @@ public sealed class FullBackupTests
         await using var verifyCmd = conn.CreateCommand();
         verifyCmd.CommandText = "SELECT is_valid, detail FROM dbbackup.pg_dbbackup_verify(@path)";
         verifyCmd.Parameters.AddWithValue("path", path);
-        await using var rdr = await verifyCmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await verifyCmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         Assert.True(rdr.GetBoolean(0), rdr.IsDBNull(1) ? null : rdr.GetString(1));
     }
 
@@ -158,7 +158,7 @@ public sealed class FullBackupTests
             "WHERE slot_name = '_pg_dbbackup_' || " +
             "(SELECT oid::text FROM pg_database WHERE datname = current_database()) " +
             "AND plugin = 'pg_dbbackup'";
-        var failover = await cmd.ExecuteScalarAsync();
+        var failover = await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
         Assert.Equal(true, failover);
     }
 
@@ -175,8 +175,8 @@ public sealed class FullBackupTests
         cmd.CommandText =
             "SELECT slot_exists, failover, synced, temporary, standby_ready " +
             "FROM dbbackup.pg_dbbackup_failover_slot_status(current_database())";
-        await using var reader = await cmd.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
+        await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
         Assert.True(reader.GetBoolean(0));
         Assert.True(reader.GetBoolean(1));
         Assert.False(reader.GetBoolean(2));
@@ -209,8 +209,8 @@ public sealed class FullBackupTests
             "JOIN pg_replication_slots s ON s.slot_name = c.slot_name";
         cmd.Parameters.AddWithValue("path", logPath);
 
-        await using var reader = await cmd.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
+        await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
         var stopLsn = reader.GetString(0);
         Assert.Equal(stopLsn, reader.GetString(1));
         Assert.Equal(stopLsn, reader.GetString(2));
@@ -232,7 +232,7 @@ public sealed class FullBackupTests
         slotCmd.CommandText =
             "SELECT slot_name::text FROM dbbackup.logical_chains " +
             "WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database())";
-        var slotBefore = (string)(await slotCmd.ExecuteScalarAsync())!;
+        var slotBefore = (string)(await slotCmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
 
         await conn.ExecAsync("INSERT INTO t VALUES (2, 'after-first-full');");
         var full2 = Helpers.BackupPath("full");
@@ -249,8 +249,8 @@ public sealed class FullBackupTests
             "JOIN pg_replication_slots s ON s.slot_name = c.slot_name";
         verify.Parameters.AddWithValue("path", full2);
 
-        await using var reader = await verify.ExecuteReaderAsync();
-        Assert.True(await reader.ReadAsync());
+        await using var reader = await verify.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
         var stopLsn = reader.GetString(0);
         Assert.Equal(slotBefore, reader.GetString(1));
         Assert.Equal(stopLsn, reader.GetString(2));
@@ -298,18 +298,18 @@ public sealed class FullBackupTests
             cmd.CommandText =
                 "SELECT '_pg_dbbackup_' || " +
                 "(SELECT oid::text FROM pg_database WHERE datname = current_database())";
-            var slotName = (string)(await cmd.ExecuteScalarAsync())!;
+            var slotName = (string)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
 
             cmd.Parameters.Clear();
             cmd.CommandText = "SELECT pg_drop_replication_slot(@slot::name)";
             cmd.Parameters.AddWithValue("slot", slotName);
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
 
             cmd.Parameters.Clear();
             cmd.CommandText =
                 "SELECT pg_create_logical_replication_slot(@slot::name, 'pg_dbbackup'::name, false, false, false)";
             cmd.Parameters.AddWithValue("slot", slotName);
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         await conn.ExecAsync("INSERT INTO t VALUES (2, 'after');");
@@ -334,18 +334,18 @@ public sealed class FullBackupTests
                 "SELECT dbbackup.pg_dbbackup(@db, @path, type := 'full', compress := false)";
             cmd.Parameters.AddWithValue("db", dbName);
             cmd.Parameters.AddWithValue("path", badPath);
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         });
 
         await using var admin = _pg.CreateConnection();
-        await admin.OpenAsync();
+        await admin.OpenAsync(TestContext.Current.CancellationToken);
         await using var cmd2 = admin.CreateCommand();
         cmd2.CommandText =
             "SELECT count(*) FROM pg_replication_slots " +
             "WHERE slot_name = '_pg_dbbackup_' || " +
             "(SELECT oid::text FROM pg_database WHERE datname = @db)";
         cmd2.Parameters.AddWithValue("db", dbName);
-        var n = (long)(await cmd2.ExecuteScalarAsync())!;
+        var n = (long)(await cmd2.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         Assert.Equal(0L, n);
     }
 }

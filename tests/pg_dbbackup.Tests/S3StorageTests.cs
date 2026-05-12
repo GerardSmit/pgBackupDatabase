@@ -40,8 +40,8 @@ public sealed class S3StorageTests
                     "       bool_and(dbbackup.pg_dbbackup_s3_object_exists('minio', manifest_key)) " +
                     "FROM dbbackup.backup_artifacts WHERE backup_id = @id";
                 cmd.Parameters.AddWithValue("id", backupId);
-                await using var reader = await cmd.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal(1L, reader.GetInt64(0));
                 Assert.True(reader.GetBoolean(1));
                 Assert.True(reader.GetBoolean(2));
@@ -52,8 +52,8 @@ public sealed class S3StorageTests
             await using var restored = await _fixture.ConnectToAsync(targetDb);
             await using var countCmd = restored.CreateCommand();
             countCmd.CommandText = "SELECT count(*), string_agg(name, ',' ORDER BY id) FROM items";
-            await using var countReader = await countCmd.ExecuteReaderAsync();
-            Assert.True(await countReader.ReadAsync());
+            await using var countReader = await countCmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await countReader.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(2L, countReader.GetInt64(0));
             Assert.Equal("alpha,beta", countReader.GetString(1));
         }
@@ -93,8 +93,8 @@ public sealed class S3StorageTests
                     "SELECT restorable, array_length(required_artifacts, 1) " +
                     "FROM dbbackup.search_backups(dbname := @db, storage_target := 'minio')";
                 search.Parameters.AddWithValue("db", sourceDb);
-                await using var reader = await search.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await search.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.True(reader.GetBoolean(0));
                 Assert.Equal(1, reader.GetInt32(1));
             }
@@ -106,7 +106,7 @@ public sealed class S3StorageTests
                 search.CommandText =
                     "SELECT count(*) FROM dbbackup.pg_dbbackup_search(@db, 'minio')";
                 search.Parameters.AddWithValue("db", sourceDb);
-                Assert.Equal(1L, (long)(await search.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await search.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await catalog.ExecAsync("DELETE FROM dbbackup.backup_artifacts");
@@ -117,13 +117,13 @@ public sealed class S3StorageTests
                 count.CommandText =
                     "SELECT count(*) FROM dbbackup.backup_artifacts WHERE dbname = @db";
                 count.Parameters.AddWithValue("db", sourceDb);
-                Assert.Equal(1L, (long)(await count.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await count.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using var restored = await _fixture.ConnectToAsync(targetDb);
             await using var check = restored.CreateCommand();
             check.CommandText = "SELECT value FROM catalog_items WHERE id = 1";
-            Assert.Equal("from-s3", (string)(await check.ExecuteScalarAsync())!);
+            Assert.Equal("from-s3", (string)(await check.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
         }
         finally
         {
@@ -163,8 +163,8 @@ public sealed class S3StorageTests
                     "ORDER BY range_end_time, backup_id";
                 search.Parameters.AddWithValue("db", db);
                 var seen = new List<string>();
-                await using var reader = await search.ExecuteReaderAsync();
-                while (await reader.ReadAsync())
+                await using var reader = await search.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                while (await reader.ReadAsync(TestContext.Current.CancellationToken))
                     seen.Add(reader.GetString(0));
                 Assert.Contains("full", seen);
                 Assert.Contains("log", seen);
@@ -176,8 +176,8 @@ public sealed class S3StorageTests
             await using var restored = await _fixture.ConnectToAsync(targetDb);
             await using var countCmd = restored.CreateCommand();
             countCmd.CommandText = "SELECT count(*), string_agg(note, ',' ORDER BY id) FROM ledger";
-            await using var countReader = await countCmd.ExecuteReaderAsync();
-            Assert.True(await countReader.ReadAsync());
+            await using var countReader = await countCmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await countReader.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(2L, countReader.GetInt64(0));
             Assert.Equal("full,log", countReader.GetString(1));
         }
@@ -215,8 +215,8 @@ public sealed class S3StorageTests
             await using var restored = await _fixture.ConnectToAsync(targetDb);
             await using var countCmd = restored.CreateCommand();
             countCmd.CommandText = "SELECT count(*), string_agg(name, ',' ORDER BY id) FROM items";
-            await using var countReader = await countCmd.ExecuteReaderAsync();
-            Assert.True(await countReader.ReadAsync());
+            await using var countReader = await countCmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await countReader.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(2L, countReader.GetInt64(0));
             Assert.Equal("full,diff", countReader.GetString(1));
         }
@@ -250,7 +250,7 @@ public sealed class S3StorageTests
                 cmd.CommandText =
                     "SELECT object_key FROM dbbackup.backup_artifacts WHERE backup_id = @id";
                 cmd.Parameters.AddWithValue("id", backupId);
-                objectKey = (string)(await cmd.ExecuteScalarAsync())!;
+                objectKey = (string)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             }
 
             await using (var delete = conn.CreateCommand())
@@ -258,7 +258,7 @@ public sealed class S3StorageTests
                 delete.CommandText =
                     "SELECT dbbackup.pg_dbbackup_s3_delete_object('minio', @key)";
                 delete.Parameters.AddWithValue("key", objectKey);
-                await delete.ExecuteNonQueryAsync();
+                await delete.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             await using (var search = conn.CreateCommand())
@@ -267,8 +267,8 @@ public sealed class S3StorageTests
                     "SELECT restorable, gap_reason " +
                     "FROM dbbackup.search_backups(dbname := @db, storage_target := 'minio')";
                 search.Parameters.AddWithValue("db", db);
-                await using var reader = await search.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await search.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.False(reader.GetBoolean(0));
                 Assert.Equal("one or more remote artifacts missing", reader.GetString(1));
             }
@@ -302,14 +302,14 @@ public sealed class S3StorageTests
                     "dbname := @db, type := 'full', storage_target := 'minio', " +
                     "compress := false)";
                 cmd.Parameters.AddWithValue("db", db);
-                jobId = (Guid)(await cmd.ExecuteScalarAsync())!;
+                jobId = (Guid)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             }
 
             await using (var wait = conn.CreateCommand())
             {
                 wait.CommandText = "SELECT dbbackup.pg_dbbackup_wait(@id, 120)";
                 wait.Parameters.AddWithValue("id", jobId);
-                Assert.Equal("completed", (string)(await wait.ExecuteScalarAsync())!);
+                Assert.Equal("completed", (string)(await wait.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = conn.CreateCommand())
@@ -317,8 +317,8 @@ public sealed class S3StorageTests
                 cmd.CommandText =
                     "SELECT status, progress_pct FROM dbbackup.pg_dbbackup_status(@id)";
                 cmd.Parameters.AddWithValue("id", jobId);
-                await using var reader = await cmd.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal("completed", reader.GetString(0));
                 Assert.Equal(100, reader.GetInt32(1));
             }
@@ -327,7 +327,7 @@ public sealed class S3StorageTests
             {
                 cmd.CommandText = "SELECT count(*) FROM dbbackup.backup_artifacts WHERE dbname = @db";
                 cmd.Parameters.AddWithValue("db", db);
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -366,8 +366,8 @@ public sealed class S3StorageTests
                     "WHERE a.backup_id = @id " +
                     "GROUP BY a.size_bytes";
                 cmd.Parameters.AddWithValue("id", backupId);
-                await using var reader = await cmd.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.True(reader.GetInt64(0) > 8L * 1024 * 1024,
                     "test backup must cross the multipart threshold");
                 Assert.Equal(1L, reader.GetInt64(1));
@@ -380,8 +380,8 @@ public sealed class S3StorageTests
             await using var check = restored.CreateCommand();
             check.CommandText =
                 "SELECT count(*), sum(length(payload)) FROM large_items";
-            await using var checkReader = await check.ExecuteReaderAsync();
-            Assert.True(await checkReader.ReadAsync());
+            await using var checkReader = await check.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await checkReader.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(35L, checkReader.GetInt64(0));
             Assert.Equal(35L * 32L * 12000L, checkReader.GetInt64(1));
         }
@@ -414,7 +414,7 @@ public sealed class S3StorageTests
                     "SELECT dbbackup.create_schedule(" +
                     "backup_set := 'prod_core', name := 'log-10m', " +
                     "backup_type := 'log', every := interval '10 minutes')";
-                var id = (Guid)(await cmd.ExecuteScalarAsync())!;
+                var id = (Guid)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.NotEqual(Guid.Empty, id);
             }
 
@@ -429,8 +429,8 @@ public sealed class S3StorageTests
                     "SELECT every = interval '5 minutes', enabled " +
                     "FROM dbbackup.backup_schedules " +
                     "WHERE backup_set = 'prod_core' AND name = 'log-10m'";
-                await using var reader = await cmd.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.True(reader.GetBoolean(0));
                 Assert.True(reader.GetBoolean(1));
             }
@@ -443,14 +443,14 @@ public sealed class S3StorageTests
                     "SELECT count(*) FROM dbbackup.list_backup_set_databases('prod_core') " +
                     "WHERE dbname = @db AND active";
                 cmd.Parameters.AddWithValue("db", db);
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await conn.ExecAsync("SELECT dbbackup.drop_schedule('prod_core', 'log-10m')");
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM dbbackup.backup_schedules";
-                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -483,7 +483,7 @@ public sealed class S3StorageTests
             {
                 run.CommandText = "SELECT dbbackup.pg_dbbackup_run_due_schedules(now())";
                 run.CommandTimeout = 180;
-                Assert.Equal(1, (int)(await run.ExecuteScalarAsync())!);
+                Assert.Equal(1, (int)(await run.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var count = conn.CreateCommand())
@@ -492,14 +492,14 @@ public sealed class S3StorageTests
                     "SELECT count(*) FROM dbbackup.backup_artifacts " +
                     "WHERE backup_set = 'prod_core' AND dbname = @db";
                 count.Parameters.AddWithValue("db", db);
-                Assert.Equal(1L, (long)(await count.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await count.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var runAgain = conn.CreateCommand())
             {
                 runAgain.CommandText = "SELECT dbbackup.pg_dbbackup_run_due_schedules(now())";
                 runAgain.CommandTimeout = 180;
-                Assert.Equal(0, (int)(await runAgain.ExecuteScalarAsync())!);
+                Assert.Equal(0, (int)(await runAgain.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await conn.ExecAsync(
@@ -512,7 +512,7 @@ public sealed class S3StorageTests
             {
                 runDue.CommandText = "SELECT dbbackup.pg_dbbackup_run_due_schedules(now())";
                 runDue.CommandTimeout = 180;
-                Assert.Equal(1, (int)(await runDue.ExecuteScalarAsync())!);
+                Assert.Equal(1, (int)(await runDue.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var count = conn.CreateCommand())
@@ -524,8 +524,8 @@ public sealed class S3StorageTests
                     "WHERE a.backup_set = 'prod_core' AND a.dbname = @db " +
                     "  AND s.backup_set = 'prod_core' AND s.name = 'full-fast'";
                 count.Parameters.AddWithValue("db", db);
-                await using var reader = await count.ExecuteReaderAsync();
-                Assert.True(await reader.ReadAsync());
+                await using var reader = await count.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await reader.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal(2L, reader.GetInt64(0));
                 Assert.Equal(2L, reader.GetInt64(1));
             }
@@ -561,19 +561,19 @@ public sealed class S3StorageTests
                     "compress := false)";
                 cmd.Parameters.AddWithValue("db", db);
                 cmd.CommandTimeout = 120;
-                await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteScalarAsync());
+                await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken));
             }
 
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM dbbackup.backup_artifacts";
-                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM dbbackup.logical_chains";
-                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(0L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -591,7 +591,7 @@ public sealed class S3StorageTests
         cmd.Parameters.AddWithValue("db", conn.Database!);
         cmd.Parameters.AddWithValue("type", type);
         cmd.CommandTimeout = 120;
-        return (Guid)(await cmd.ExecuteScalarAsync())!;
+        return (Guid)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
     }
 
     private static async Task RestoreFromStorageAsync(
@@ -606,7 +606,7 @@ public sealed class S3StorageTests
         cmd.Parameters.AddWithValue("db", db);
         cmd.Parameters.AddWithValue("target", targetDb);
         cmd.CommandTimeout = 120;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static async Task ConfigureTargetOnlyAsync(
@@ -624,7 +624,7 @@ public sealed class S3StorageTests
         cmd.Parameters.AddWithValue("name", targetName);
         cmd.Parameters.AddWithValue("bucket", bucket);
         cmd.Parameters.AddWithValue("prefix", prefix);
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static string BucketName() =>

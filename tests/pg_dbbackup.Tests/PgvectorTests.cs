@@ -21,7 +21,7 @@ public sealed class PgvectorTests
         cmd.Parameters.AddWithValue("p", path);
         cmd.Parameters.AddWithValue("tgt", target);
         cmd.CommandTimeout = 180;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         return target;
     }
 
@@ -56,14 +56,14 @@ public sealed class PgvectorTests
             await using (var c = rconn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM items";
-                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
             {
                 c.CommandText =
                     "SELECT id FROM items ORDER BY embedding <-> '[1,2,3]'::vector LIMIT 1";
-                var nearestId = (int)(await c.ExecuteScalarAsync())!;
+                var nearestId = (int)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.Equal(1, nearestId);
             }
 
@@ -71,7 +71,7 @@ public sealed class PgvectorTests
             {
                 c.CommandText =
                     "SELECT embedding::text FROM items WHERE id = 2";
-                var emb = (string)(await c.ExecuteScalarAsync())!;
+                var emb = (string)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.Equal("[4,5,6]", emb);
             }
         }
@@ -114,7 +114,7 @@ public sealed class PgvectorTests
                 c.CommandText =
                     "SELECT count(*) FROM pg_indexes " +
                     "WHERE tablename = 'docs' AND indexname = 'docs_hnsw'";
-                Assert.Equal(1L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
@@ -124,7 +124,7 @@ public sealed class PgvectorTests
                     "  SELECT id FROM docs " +
                     "  ORDER BY embedding <-> '[0.5,0.5,0.5]'::vector LIMIT 5" +
                     ") s";
-                Assert.Equal(5L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(5L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -166,7 +166,7 @@ public sealed class PgvectorTests
                 c.CommandText =
                     "SELECT indexdef FROM pg_indexes " +
                     "WHERE tablename = 'items' AND indexname = 'items_ivf'";
-                var def = (string?)await c.ExecuteScalarAsync();
+                var def = (string?)await c.ExecuteScalarAsync(TestContext.Current.CancellationToken);
                 Assert.NotNull(def);
                 Assert.Contains("ivfflat", def!);
             }
@@ -178,7 +178,7 @@ public sealed class PgvectorTests
                     "  SELECT id FROM items " +
                     "  ORDER BY embedding <-> '[0.5,0.5,0.5]'::vector LIMIT 3" +
                     ") s";
-                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(3L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally

@@ -59,8 +59,8 @@ public sealed class BakfileFormatTests
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT is_valid, detail FROM dbbackup.pg_dbbackup_verify(@path)";
         cmd.Parameters.AddWithValue("path", path);
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         var isValid = rdr.GetBoolean(0);
         Assert.False(isValid);
     }
@@ -90,8 +90,8 @@ public sealed class BakfileFormatTests
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT is_valid, detail FROM dbbackup.pg_dbbackup_verify(@path)";
         cmd.Parameters.AddWithValue("path", path);
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         var isValid = rdr.GetBoolean(0);
         var detail = rdr.IsDBNull(1) ? null : rdr.GetString(1);
         Assert.True(isValid, $"verify failed: {detail}");
@@ -111,8 +111,8 @@ public sealed class BakfileFormatTests
             "FROM dbbackup.pg_dbbackup_header(@path)";
         cmd.Parameters.AddWithValue("path", path);
 
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         Assert.Equal("full", rdr.GetString(0));
         Assert.Equal("simple", rdr.GetString(1));
         Assert.Equal(dbName, rdr.GetString(2));

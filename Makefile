@@ -1,6 +1,6 @@
 EXTENSION = pg_dbbackup
-EXTVERSION = 1.0.0
-DATA = sql/pg_dbbackup--1.0.0.sql
+EXTVERSION = 0.0.1
+DATA = sql/pg_dbbackup--0.0.1.sql
 
 MODULE_big = pg_dbbackup
 OBJS = \
@@ -24,6 +24,13 @@ OBJS = \
 	src/libpq_helpers.o
 
 PG_CPPFLAGS = -I$(srcdir)/src -I$(shell $(PG_CONFIG) --includedir)
+
+# Surface real type/format/lifetime bugs at compile time. -Wno-unused-parameter
+# is needed because the fmgr entry-point signature (PG_FUNCTION_ARGS) often
+# leaves fcinfo unused in trivial wrappers; -Wno-declaration-after-statement
+# matches Postgres's own coding style (which mixes decls into blocks).
+PG_CFLAGS += -Wall -Wextra -Wno-unused-parameter -Wno-declaration-after-statement -Werror=implicit-function-declaration
+
 SHLIB_LINK += -lzstd -lcrypto -lcurl -L$(shell $(PG_CONFIG) --libdir) -lpq
 
 PG_CONFIG ?= pg_config

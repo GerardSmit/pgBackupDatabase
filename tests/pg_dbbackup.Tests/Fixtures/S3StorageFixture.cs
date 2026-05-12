@@ -9,7 +9,7 @@ namespace PgDbBackup.Tests.Fixtures;
 
 public sealed class S3StorageFixture : IAsyncLifetime
 {
-    private const string PostgresImage = "postgres:17";
+    private static string PostgresImage => Helpers.PostgresImage;
     private const string PostgresUser = "postgres";
     private const string PostgresPassword = "postgres";
     private const string PostgresDb = "postgres";
@@ -25,26 +25,24 @@ public sealed class S3StorageFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
-        var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, "17");
+        var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, Helpers.PgMajor);
 
         _network = new NetworkBuilder().Build();
-        await _network.CreateAsync();
+        await _network.CreateAsync(TestContext.Current.CancellationToken);
 
-        _minio = new ContainerBuilder()
-            .WithImage(MinioImage)
+        _minio = new ContainerBuilder(MinioImage)
             .WithEnvironment("MINIO_ROOT_USER", AccessKey)
             .WithEnvironment("MINIO_ROOT_PASSWORD", SecretKey)
             .WithCommand("server", "/data", "--address", ":9000")
             .WithNetwork(_network)
             .WithNetworkAliases("minio")
             .WithPortBinding(9000, true)
-            .WithWaitStrategy(Wait.ForUnixContainer().UntilPortIsAvailable(9000))
+            .WithWaitStrategy(Wait.ForUnixContainer().UntilInternalTcpPortIsAvailable(9000))
             .Build();
 
-        await _minio.StartAsync();
+        await _minio.StartAsync(TestContext.Current.CancellationToken);
 
-        _postgres = new PostgreSqlBuilder()
-            .WithImage(image)
+        _postgres = new PostgreSqlBuilder(image)
             .WithUsername(PostgresUser)
             .WithPassword(PostgresPassword)
             .WithDatabase(PostgresDb)
@@ -65,7 +63,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
                 .AddCustomWaitStrategy(new ImmediateReadyWait()))
             .Build();
 
-        await _postgres.StartAsync();
+        await _postgres.StartAsync(TestContext.Current.CancellationToken);
         await WaitForReadyConnectionAsync();
         await EnsureExtensionInPostgresDbAsync();
     }
@@ -85,7 +83,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
     public async Task<NpgsqlConnection> AdminAsync()
     {
         var conn = CreateConnection();
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -96,7 +94,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
             Database = dbName,
         };
         var conn = new NpgsqlConnection(builder.ConnectionString);
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -106,7 +104,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
 
         await using (var admin = CreateConnection())
         {
-            await admin.OpenAsync();
+            await admin.OpenAsync(TestContext.Current.CancellationToken);
             await using var cmd = admin.CreateCommand();
             cmd.CommandText = $"CREATE DATABASE \"{dbName}\"";
             await cmd.ExecuteNonQueryAsync();
@@ -125,7 +123,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
     {
         NpgsqlConnection.ClearAllPools();
         await using var admin = CreateConnection();
-        await admin.OpenAsync();
+        await admin.OpenAsync(TestContext.Current.CancellationToken);
         await using var cmd = admin.CreateCommand();
         cmd.CommandText = $"DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)";
         cmd.CommandTimeout = 60;
@@ -163,7 +161,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
     private async Task EnsureExtensionInPostgresDbAsync()
     {
         await using var conn = CreateConnection();
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_dbbackup";
         await cmd.ExecuteNonQueryAsync();
@@ -178,7 +176,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
             try
             {
                 await using var c = CreateConnection();
-                await c.OpenAsync();
+                await c.OpenAsync(TestContext.Current.CancellationToken);
                 await using var cmd = c.CreateCommand();
                 cmd.CommandText = "SELECT 1";
                 await cmd.ExecuteScalarAsync();
@@ -187,7 +185,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(1000);
+                await Task.Delay(1000, TestContext.Current.CancellationToken);
             }
         }
 
@@ -208,7 +206,7 @@ public sealed class S3StorageFixture : IAsyncLifetime
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(500);
+                await Task.Delay(500, TestContext.Current.CancellationToken);
             }
         }
 

@@ -17,7 +17,7 @@ public sealed class FailoverSlotTests
     [Fact]
     public async Task FullLog_Refuses_To_Continue_After_Promotion_When_Failover_Slot_Not_Ready()
     {
-        var image = await CachedPgDbBackupImage.BuildAsync("postgres:17", "17");
+        var image = await CachedPgDbBackupImage.BuildAsync(Helpers.PostgresImage, Helpers.PgMajor);
         var dbName = "failover_" + Guid.NewGuid().ToString("N")[..8];
         var targetDb = "failover_restored_" + Guid.NewGuid().ToString("N")[..8];
         const string fullPath = "/tmp/failover_full.bak";
@@ -27,7 +27,7 @@ public sealed class FailoverSlotTests
             $"pgdbbackup_failover_{Guid.NewGuid():N}.bak");
 
         await using var network = new NetworkBuilder().Build();
-        await network.CreateAsync();
+        await network.CreateAsync(TestContext.Current.CancellationToken);
 
         IContainer? primary = null;
         IContainer? standby = null;
@@ -35,7 +35,7 @@ public sealed class FailoverSlotTests
         try
         {
             primary = BuildPrimary(image, network);
-            await primary.StartAsync();
+            await primary.StartAsync(TestContext.Current.CancellationToken);
             await WaitForReadyConnectionAsync(primary, "primary");
 
             await using (var admin = await ConnectAsync(primary, PostgresDb))
@@ -51,7 +51,7 @@ public sealed class FailoverSlotTests
                 "enable replication host auth");
 
             standby = BuildStandby(image, network);
-            await standby.StartAsync();
+            await standby.StartAsync(TestContext.Current.CancellationToken);
             await WaitForReadyConnectionAsync(standby, "standby");
             await WaitForConditionAsync(async () =>
             {
@@ -121,7 +121,7 @@ public sealed class FailoverSlotTests
             await DockerCpFromAsync(primary, fullPath, hostFullPath);
             await DockerCpToAsync(hostFullPath, standby, fullPath);
 
-            await primary.StopAsync();
+            await primary.StopAsync(TestContext.Current.CancellationToken);
             await using (var standbyAdmin = await ConnectAsync(standby, PostgresDb))
             {
                 Assert.True(await ScalarAsync<bool>(standbyAdmin, "SELECT pg_promote(true, 60)"));
@@ -165,8 +165,7 @@ public sealed class FailoverSlotTests
     }
 
     private static IContainer BuildPrimary(string image, INetwork network) =>
-        new ContainerBuilder()
-            .WithImage(image)
+        new ContainerBuilder(image)
             .WithNetwork(network)
             .WithNetworkAliases("pg-primary")
             .WithPortBinding(5432, true)
@@ -214,8 +213,7 @@ public sealed class FailoverSlotTests
             "-c wal_keep_size=128 " +
             "-c listen_addresses=*\"";
 
-        return new ContainerBuilder()
-            .WithImage(image)
+        return new ContainerBuilder(image)
             .WithNetwork(network)
             .WithNetworkAliases("pg-standby")
             .WithPortBinding(5432, true)
@@ -245,7 +243,7 @@ public sealed class FailoverSlotTests
         string database)
     {
         var conn = new NpgsqlConnection(ConnectionString(container, database));
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -261,16 +259,16 @@ public sealed class FailoverSlotTests
             try
             {
                 await using var conn = new NpgsqlConnection(connectionString);
-                await conn.OpenAsync();
+                await conn.OpenAsync(TestContext.Current.CancellationToken);
                 await using var cmd = conn.CreateCommand();
                 cmd.CommandText = "SELECT 1";
-                await cmd.ExecuteScalarAsync();
+                await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
                 return;
             }
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(500);
+                await Task.Delay(500, TestContext.Current.CancellationToken);
             }
         }
 
@@ -289,7 +287,7 @@ public sealed class FailoverSlotTests
         {
             if (await predicate())
                 return;
-            await Task.Delay(500);
+            await Task.Delay(500, TestContext.Current.CancellationToken);
         }
 
         throw new TimeoutException($"Timed out waiting for {label}");
@@ -320,7 +318,7 @@ public sealed class FailoverSlotTests
             if (observed)
                 return;
 
-            await Task.Delay(500);
+            await Task.Delay(500, TestContext.Current.CancellationToken);
         }
 
         throw new TimeoutException(
@@ -333,7 +331,7 @@ public sealed class FailoverSlotTests
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.CommandTimeout = 240;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static async Task<T> ScalarAsync<T>(
@@ -346,7 +344,7 @@ public sealed class FailoverSlotTests
         cmd.CommandTimeout = 240;
         foreach (var (name, value) in parameters)
             cmd.Parameters.AddWithValue(name, value);
-        return (T)(await cmd.ExecuteScalarAsync())!;
+        return (T)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
     }
 
     private static async Task BackupAsync(
@@ -364,7 +362,7 @@ public sealed class FailoverSlotTests
         cmd.Parameters.AddWithValue("type", type);
         cmd.Parameters.AddWithValue("base", (object?)basePath ?? DBNull.Value);
         cmd.CommandTimeout = 240;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static async Task ShellOrThrowAsync(

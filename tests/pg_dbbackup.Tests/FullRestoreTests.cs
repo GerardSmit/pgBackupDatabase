@@ -36,7 +36,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -45,7 +45,7 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "SELECT count(*) FROM widgets";
             c.CommandTimeout = 30;
-            var n = (long)(await c.ExecuteScalarAsync())!;
+            var n = (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(100L, n);
 
         }
@@ -79,7 +79,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("db", dbName);
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -92,7 +92,7 @@ public sealed class FullRestoreTests
                 "(SELECT oid::text FROM pg_database WHERE datname = @db) " +
                 "AND plugin = 'pg_dbbackup'";
             slot.Parameters.AddWithValue("db", dbName);
-            Assert.Equal(true, await slot.ExecuteScalarAsync());
+            Assert.Equal(true, await slot.ExecuteScalarAsync(TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -125,7 +125,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -134,7 +134,7 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "INSERT INTO t(v) VALUES ('d') RETURNING id";
             c.CommandTimeout = 30;
-            Assert.Equal(4L, (long)(await c.ExecuteScalarAsync())!);
+            Assert.Equal(4L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
         }
         finally
         {
@@ -172,7 +172,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("p2", logPath);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -181,7 +181,7 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "INSERT INTO t(v) VALUES ('next') RETURNING id";
             c.CommandTimeout = 30;
-            Assert.Equal(3L, (long)(await c.ExecuteScalarAsync())!);
+            Assert.Equal(3L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
         }
         finally
         {
@@ -215,7 +215,7 @@ public sealed class FullRestoreTests
             cmd.Parameters.AddWithValue("p", path);
             cmd.Parameters.AddWithValue("tgt", target);
             cmd.CommandTimeout = 120;
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -247,7 +247,7 @@ public sealed class FullRestoreTests
             cmd.Parameters.AddWithValue("tgt", target);
 
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -275,9 +275,9 @@ public sealed class FullRestoreTests
         await using (var c = src.CreateCommand())
         {
             c.CommandText = "SELECT now()";
-            cutoff = (DateTime)(await c.ExecuteScalarAsync())!;
+            cutoff = (DateTime)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
-        await Task.Delay(1000);
+        await Task.Delay(1000, TestContext.Current.CancellationToken);
 
         var path = Helpers.BackupPath("fullrestore");
         await src.BackupFullAsync(path);
@@ -297,7 +297,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.Parameters.AddWithValue("cutoff", cutoff);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -306,7 +306,7 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "SELECT count(*) FROM t";
             c.CommandTimeout = 30;
-            var n = (long)(await c.ExecuteScalarAsync())!;
+            var n = (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(50L, n);
         }
         finally
@@ -334,9 +334,9 @@ public sealed class FullRestoreTests
         await using (var c = src.CreateCommand())
         {
             c.CommandText = "SELECT now()";
-            midCutoff = (DateTime)(await c.ExecuteScalarAsync())!;
+            midCutoff = (DateTime)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
-        await Task.Delay(1500);
+        await Task.Delay(1500, TestContext.Current.CancellationToken);
 
         await src.ExecAsync(
             "INSERT INTO t SELECT g FROM generate_series(11, 30) g");
@@ -360,7 +360,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.Parameters.AddWithValue("cutoff", midCutoff);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -369,7 +369,7 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "SELECT count(*) FROM t";
             c.CommandTimeout = 30;
-            var n = (long)(await c.ExecuteScalarAsync())!;
+            var n = (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(10L, n);
         }
         finally
@@ -389,17 +389,17 @@ public sealed class FullRestoreTests
         var fullPath = Helpers.BackupPath("fullrestore");
         await src.BackupFullAsync(fullPath);
 
-        await Task.Delay(1200);
+        await Task.Delay(1200, TestContext.Current.CancellationToken);
         await src.ExecAsync("INSERT INTO t SELECT g FROM generate_series(11, 20) g");
 
         DateTime cutoff;
         await using (var c = src.CreateCommand())
         {
             c.CommandText = "SELECT clock_timestamp()";
-            cutoff = (DateTime)(await c.ExecuteScalarAsync())!;
+            cutoff = (DateTime)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
 
-        await Task.Delay(1500);
+        await Task.Delay(1500, TestContext.Current.CancellationToken);
         await src.ExecAsync("INSERT INTO t SELECT g FROM generate_series(21, 30) g");
 
         var logPath = Helpers.BackupPath("fulllog");
@@ -421,7 +421,7 @@ public sealed class FullRestoreTests
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.Parameters.AddWithValue("cutoff", cutoff);
                 cmd.CommandTimeout = 240;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -430,8 +430,8 @@ public sealed class FullRestoreTests
             await using var c = conn.CreateCommand();
             c.CommandText = "SELECT count(*), max(id) FROM t";
             c.CommandTimeout = 30;
-            await using var r = await c.ExecuteReaderAsync();
-            Assert.True(await r.ReadAsync());
+            await using var r = await c.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await r.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(20L, r.GetInt64(0));
             Assert.Equal(20, r.GetInt32(1));
         }
@@ -470,7 +470,7 @@ public sealed class FullRestoreTests
             cmd.Parameters.AddWithValue("tgt", target);
 
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
         }
 
         Assert.False(await _pg.DbExistsAsync(target),
@@ -481,7 +481,7 @@ public sealed class FullRestoreTests
         {
             cmd.CommandText =
                 "SELECT count(*) FROM pg_database WHERE datname LIKE '_pg_dbbackup_restore_%'";
-            var n = (long)(await cmd.ExecuteScalarAsync())!;
+            var n = (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(0L, n);
         }
     }

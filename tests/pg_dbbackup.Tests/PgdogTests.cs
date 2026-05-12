@@ -19,7 +19,7 @@ public sealed class PgdogTests
     [Fact]
     public async Task Pgdog_Backup_Primary_Route_Succeeds_Replica_Route_Errors()
     {
-        var image = await CachedPgDbBackupImage.BuildAsync("postgres:17", "17");
+        var image = await CachedPgDbBackupImage.BuildAsync(Helpers.PostgresImage, Helpers.PgMajor);
         var dbName = "pgdog_" + Guid.NewGuid().ToString("N")[..8];
         var fullPath = $"/tmp/{dbName}_full.bak";
         var primaryPgdogConfigDir = Path.Combine(
@@ -30,7 +30,7 @@ public sealed class PgdogTests
             $"pgdbbackup_pgdog_standby_{Guid.NewGuid():N}");
 
         await using var network = new NetworkBuilder().Build();
-        await network.CreateAsync();
+        await network.CreateAsync(TestContext.Current.CancellationToken);
 
         IContainer? primary = null;
         IContainer? standby = null;
@@ -40,7 +40,7 @@ public sealed class PgdogTests
         try
         {
             primary = BuildPrimary(image, network);
-            await primary.StartAsync();
+            await primary.StartAsync(TestContext.Current.CancellationToken);
             await WaitForReadyConnectionAsync(primary, "primary");
 
             await using (var admin = await ConnectAsync(primary, PostgresDb))
@@ -56,7 +56,7 @@ public sealed class PgdogTests
                 "enable replication host auth");
 
             standby = BuildStandby(image, network);
-            await standby.StartAsync();
+            await standby.StartAsync(TestContext.Current.CancellationToken);
             await WaitForReadyConnectionAsync(standby, "standby");
             await WaitForConditionAsync(async () =>
             {
@@ -101,7 +101,7 @@ public sealed class PgdogTests
                 dbName,
                 routeAlias: "pgdog-primary-route",
                 configDir: primaryPgdogConfigDir);
-            await primaryPgdog.StartAsync();
+            await primaryPgdog.StartAsync(TestContext.Current.CancellationToken);
             await WaitForPgdogConnectionAsync(primaryPgdog, dbName, "primary route");
 
             await using (var throughPrimary = await ConnectPgdogAsync(primaryPgdog, dbName))
@@ -143,7 +143,7 @@ public sealed class PgdogTests
                 dbName,
                 routeAlias: "pgdog-standby-route",
                 configDir: standbyPgdogConfigDir);
-            await standbyPgdog.StartAsync();
+            await standbyPgdog.StartAsync(TestContext.Current.CancellationToken);
 
             var pgdogEx = await Assert.ThrowsAnyAsync<Exception>(async () =>
             {
@@ -169,8 +169,7 @@ public sealed class PgdogTests
     }
 
     private static IContainer BuildPrimary(string image, INetwork network) =>
-        new ContainerBuilder()
-            .WithImage(image)
+        new ContainerBuilder(image)
             .WithNetwork(network)
             .WithNetworkAliases("pg-primary")
             .WithPortBinding(5432, true)
@@ -218,8 +217,7 @@ public sealed class PgdogTests
             "-c wal_keep_size=128 " +
             "-c listen_addresses=*\"";
 
-        return new ContainerBuilder()
-            .WithImage(image)
+        return new ContainerBuilder(image)
             .WithNetwork(network)
             .WithNetworkAliases("pg-standby")
             .WithPortBinding(5432, true)
@@ -251,8 +249,7 @@ public sealed class PgdogTests
             PgdogUsers(dbName),
             Encoding.ASCII);
 
-        return new ContainerBuilder()
-            .WithImage(PgdogImage)
+        return new ContainerBuilder(PgdogImage)
             .WithNetwork(network)
             .WithNetworkAliases(routeAlias)
             .WithPortBinding(6432, true)
@@ -319,7 +316,7 @@ public sealed class PgdogTests
         string database)
     {
         var conn = new NpgsqlConnection(PostgresConnectionString(container, database));
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -328,7 +325,7 @@ public sealed class PgdogTests
         string database)
     {
         var conn = new NpgsqlConnection(PgdogConnectionString(container, database));
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -344,16 +341,16 @@ public sealed class PgdogTests
             try
             {
                 await using var conn = new NpgsqlConnection(connectionString);
-                await conn.OpenAsync();
+                await conn.OpenAsync(TestContext.Current.CancellationToken);
                 await using var cmd = conn.CreateCommand();
                 cmd.CommandText = "SELECT 1";
-                await cmd.ExecuteScalarAsync();
+                await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
                 return;
             }
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(500);
+                await Task.Delay(500, TestContext.Current.CancellationToken);
             }
         }
 
@@ -375,16 +372,16 @@ public sealed class PgdogTests
             try
             {
                 await using var conn = new NpgsqlConnection(connectionString);
-                await conn.OpenAsync();
+                await conn.OpenAsync(TestContext.Current.CancellationToken);
                 await using var cmd = conn.CreateCommand();
                 cmd.CommandText = "SELECT 1";
-                await cmd.ExecuteScalarAsync();
+                await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
                 return;
             }
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(500);
+                await Task.Delay(500, TestContext.Current.CancellationToken);
             }
         }
 
@@ -403,7 +400,7 @@ public sealed class PgdogTests
         {
             if (await predicate())
                 return;
-            await Task.Delay(500);
+            await Task.Delay(500, TestContext.Current.CancellationToken);
         }
 
         throw new TimeoutException($"Timed out waiting for {label}");
@@ -414,7 +411,7 @@ public sealed class PgdogTests
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = sql;
         cmd.CommandTimeout = 240;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static async Task<T> ScalarAsync<T>(
@@ -427,7 +424,7 @@ public sealed class PgdogTests
         cmd.CommandTimeout = 240;
         foreach (var (name, value) in parameters)
             cmd.Parameters.AddWithValue(name, value);
-        return (T)(await cmd.ExecuteScalarAsync())!;
+        return (T)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
     }
 
     private static async Task BackupAsync(
@@ -445,7 +442,7 @@ public sealed class PgdogTests
         cmd.Parameters.AddWithValue("type", type);
         cmd.Parameters.AddWithValue("base", (object?)basePath ?? DBNull.Value);
         cmd.CommandTimeout = 240;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
     }
 
     private static void AssertStandbyBackupError(Exception ex)

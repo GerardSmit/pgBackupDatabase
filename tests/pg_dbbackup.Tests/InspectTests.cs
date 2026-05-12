@@ -26,8 +26,8 @@ public sealed class InspectTests
             "FROM dbbackup.pg_dbbackup_header(@path)";
         cmd.Parameters.AddWithValue("path", path);
 
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         Assert.Equal("full", rdr.GetString(0));
         Assert.Equal("simple", rdr.GetString(1));
         Assert.Equal(dbName, rdr.GetString(2));
@@ -59,8 +59,8 @@ public sealed class InspectTests
             "FROM dbbackup.pg_dbbackup_header(@path)";
         cmd.Parameters.AddWithValue("path", diffPath);
 
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         Assert.Equal("differential", rdr.GetString(0));
         Assert.Equal("full", rdr.GetString(1));
         var baseLsn = rdr.GetString(2);
@@ -82,8 +82,8 @@ public sealed class InspectTests
             "FROM dbbackup.pg_dbbackup_header(@path)";
         cmd.Parameters.AddWithValue("path", path);
 
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        Assert.True(await rdr.ReadAsync());
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
         Assert.True(rdr.GetBoolean(0));
         Assert.True(rdr.GetBoolean(1));
     }
@@ -108,9 +108,9 @@ public sealed class InspectTests
         cmd.Parameters.AddWithValue("path", path);
 
         var paths = new List<string>();
-        await using (var rdr = await cmd.ExecuteReaderAsync())
+        await using (var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken))
         {
-            while (await rdr.ReadAsync())
+            while (await rdr.ReadAsync(TestContext.Current.CancellationToken))
             {
                 paths.Add(rdr.GetString(0));
             }
@@ -137,8 +137,8 @@ public sealed class InspectTests
         cmd.Parameters.AddWithValue("path", path);
 
         int rowCount = 0;
-        await using var rdr = await cmd.ExecuteReaderAsync();
-        while (await rdr.ReadAsync())
+        await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        while (await rdr.ReadAsync(TestContext.Current.CancellationToken))
         {
             var checksum = rdr.GetString(0);
             Assert.Equal(64, checksum.Length);
@@ -165,7 +165,7 @@ public sealed class InspectTests
                 "SELECT count(*) FROM dbbackup.pg_dbbackup_filelist(@path)";
             cmd.Parameters.AddWithValue("path", path);
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteScalarAsync());
+                () => cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken));
         }
 
         await using (var cmd2 = conn.CreateCommand())
@@ -174,7 +174,7 @@ public sealed class InspectTests
                 "SELECT count(*) FROM dbbackup.pg_dbbackup_filelist(@path, @pw)";
             cmd2.Parameters.AddWithValue("path", path);
             cmd2.Parameters.AddWithValue("pw", "topsecret");
-            var n = (long)(await cmd2.ExecuteScalarAsync())!;
+            var n = (long)(await cmd2.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.True(n > 0);
         }
     }
@@ -196,6 +196,6 @@ public sealed class InspectTests
         cmd.Parameters.AddWithValue("path", path);
         cmd.Parameters.AddWithValue("pw", "wrongpw");
         await Assert.ThrowsAsync<PostgresException>(
-            () => cmd.ExecuteScalarAsync());
+            () => cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken));
     }
 }

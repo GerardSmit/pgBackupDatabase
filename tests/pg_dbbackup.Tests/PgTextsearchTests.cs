@@ -21,7 +21,7 @@ public sealed class PgTextsearchTests
         cmd.Parameters.AddWithValue("p", path);
         cmd.Parameters.AddWithValue("tgt", target);
         cmd.CommandTimeout = 180;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         return target;
     }
 
@@ -61,7 +61,7 @@ public sealed class PgTextsearchTests
             await using (var c = rconn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM articles";
-                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
@@ -69,7 +69,7 @@ public sealed class PgTextsearchTests
                 c.CommandText =
                     "SELECT id FROM articles " +
                     "ORDER BY body <@> 'lazy'::bm25query ASC LIMIT 1";
-                var topId = (int)(await c.ExecuteScalarAsync())!;
+                var topId = (int)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.True(topId == 1 || topId == 4,
                     $"top BM25 match should be a doc containing 'lazy' (got id={topId})");
             }
@@ -115,7 +115,7 @@ public sealed class PgTextsearchTests
                 c.CommandText =
                     "SELECT count(*) FROM pg_indexes " +
                     "WHERE tablename = 'docs' AND indexname = 'docs_bm25'";
-                Assert.Equal(1L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
@@ -124,7 +124,7 @@ public sealed class PgTextsearchTests
                     "SELECT amname FROM pg_class c " +
                     "JOIN pg_am a ON c.relam = a.oid " +
                     "WHERE c.relname = 'docs_bm25'";
-                var am = (string)(await c.ExecuteScalarAsync())!;
+                var am = (string)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.Equal("bm25", am);
             }
 
@@ -135,7 +135,7 @@ public sealed class PgTextsearchTests
                     "  SELECT id FROM docs " +
                     "  ORDER BY body <@> 'searchable'::bm25query ASC LIMIT 5" +
                     ") s";
-                Assert.True((long)(await c.ExecuteScalarAsync())! > 0L,
+                Assert.True((long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))! > 0L,
                     "BM25 search should return matches after restore");
             }
         }

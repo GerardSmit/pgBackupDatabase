@@ -21,7 +21,7 @@ public sealed class MultiExtensionTests
         cmd.Parameters.AddWithValue("p", path);
         cmd.Parameters.AddWithValue("tgt", target);
         cmd.CommandTimeout = 180;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         return target;
     }
 
@@ -64,14 +64,14 @@ public sealed class MultiExtensionTests
             await using (var c = rconn.CreateCommand())
             {
                 c.CommandText = "SELECT count(*) FROM notes";
-                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(4L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
             {
                 c.CommandText =
                     "SELECT id FROM notes ORDER BY embedding <-> '[1,0,0]'::vector LIMIT 1";
-                Assert.Equal(1, (int)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(1, (int)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = rconn.CreateCommand())
@@ -81,7 +81,7 @@ public sealed class MultiExtensionTests
                     "  SELECT id FROM notes " +
                     "  ORDER BY body <@> 'searchable'::bm25query ASC LIMIT 4" +
                     ") s WHERE s.id IN (3, 4)";
-                Assert.True((long)(await c.ExecuteScalarAsync())! >= 1L,
+                Assert.True((long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))! >= 1L,
                     "BM25 top results should include docs with 'searchable'");
             }
 
@@ -90,7 +90,7 @@ public sealed class MultiExtensionTests
                 c.CommandText =
                     "SELECT count(*) FROM pg_extension " +
                     "WHERE extname IN ('vector','pg_textsearch')";
-                Assert.Equal(2L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(2L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally

@@ -12,6 +12,11 @@ namespace PgDbBackup.Tests;
 /// </summary>
 internal static class Helpers
 {
+    public static string PgMajor =>
+        Environment.GetEnvironmentVariable("PG_DBBACKUP_PG_VERSION") ?? "17";
+
+    public static string PostgresImage => $"postgres:{PgMajor}";
+
     public const byte SectionMetadata = 0x01;
     public const byte SectionSchema = 0x02;
     public const byte SectionData = 0x03;

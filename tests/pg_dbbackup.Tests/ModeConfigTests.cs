@@ -19,7 +19,7 @@ public sealed class ModeConfigTests
         cmd.CommandText = "SELECT dbbackup.pg_dbbackup_get_mode(@db)";
         cmd.Parameters.AddWithValue("db", conn.Database!);
 
-        var mode = (string?)await cmd.ExecuteScalarAsync();
+        var mode = (string?)await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
         Assert.Equal("simple", mode);
     }
 
@@ -34,14 +34,14 @@ public sealed class ModeConfigTests
             set.CommandText = "SELECT dbbackup.pg_dbbackup_set_mode(@db, @mode)";
             set.Parameters.AddWithValue("db", dbName);
             set.Parameters.AddWithValue("mode", "full");
-            await set.ExecuteNonQueryAsync();
+            await set.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         await using var get = conn.CreateCommand();
         get.CommandText = "SELECT dbbackup.pg_dbbackup_get_mode(@db)";
         get.Parameters.AddWithValue("db", dbName);
 
-        var mode = (string?)await get.ExecuteScalarAsync();
+        var mode = (string?)await get.ExecuteScalarAsync(TestContext.Current.CancellationToken);
         Assert.Equal("full", mode);
     }
 
@@ -55,7 +55,7 @@ public sealed class ModeConfigTests
         {
             ensure.CommandText = "SELECT dbbackup.pg_dbbackup_set_mode(@db, 'simple')";
             ensure.Parameters.AddWithValue("db", dbName);
-            await ensure.ExecuteNonQueryAsync();
+            await ensure.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         await using var cmd = conn.CreateCommand();
@@ -63,7 +63,7 @@ public sealed class ModeConfigTests
         cmd.Parameters.AddWithValue("db", dbName);
         cmd.Parameters.AddWithValue("path", "/tmp/dummy.bak");
 
-        await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteNonQueryAsync());
+        await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
     }
 
     [Fact]
@@ -75,6 +75,6 @@ public sealed class ModeConfigTests
         cmd.CommandText = "SELECT dbbackup.pg_dbbackup_set_mode(@db, 'bogus')";
         cmd.Parameters.AddWithValue("db", conn.Database!);
 
-        await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteNonQueryAsync());
+        await Assert.ThrowsAsync<PostgresException>(() => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
     }
 }

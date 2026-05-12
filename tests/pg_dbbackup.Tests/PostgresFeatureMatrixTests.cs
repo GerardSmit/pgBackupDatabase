@@ -48,7 +48,7 @@ public sealed class PostgresFeatureMatrixTests
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT array_agg(item_id ORDER BY item_id) FROM audit";
-                var audited = (int[])(await cmd.ExecuteScalarAsync())!;
+                var audited = (int[])(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.Equal(new[] { 1, 2 }, audited);
             }
 
@@ -56,7 +56,7 @@ public sealed class PostgresFeatureMatrixTests
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM audit WHERE item_id = 3 AND action = 'INSERT'";
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -101,20 +101,20 @@ public sealed class PostgresFeatureMatrixTests
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM events";
-                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM pg_inherits WHERE inhparent = 'events'::regclass";
-                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await conn.ExecAsync("INSERT INTO events VALUES ('2026-02-20', 3, 'routed');");
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM events_2026_02";
-                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -156,8 +156,8 @@ public sealed class PostgresFeatureMatrixTests
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT id, doubled, status::text FROM accounts";
-                await using var rdr = await cmd.ExecuteReaderAsync();
-                Assert.True(await rdr.ReadAsync());
+                await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal(1, rdr.GetInt32(0));
                 Assert.Equal(10, rdr.GetInt32(1));
                 Assert.Equal("ok", rdr.GetString(2));
@@ -171,8 +171,8 @@ public sealed class PostgresFeatureMatrixTests
                     "LEFT JOIN pg_policy p ON p.polrelid = c.oid " +
                     "WHERE c.oid = 'accounts'::regclass " +
                     "GROUP BY c.relrowsecurity";
-                await using var rdr = await cmd.ExecuteReaderAsync();
-                Assert.True(await rdr.ReadAsync());
+                await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.True(rdr.GetBoolean(0));
                 Assert.Equal(1L, rdr.GetInt64(1));
             }
@@ -181,7 +181,7 @@ public sealed class PostgresFeatureMatrixTests
             {
                 cmd.CommandText = "INSERT INTO accounts(email, qty) VALUES ('invalid', 1)";
                 var ex = await Assert.ThrowsAsync<PostgresException>(
-                    () => cmd.ExecuteNonQueryAsync());
+                    () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
                 Assert.Equal("23514", ex.SqlState);
             }
 
@@ -190,8 +190,8 @@ public sealed class PostgresFeatureMatrixTests
                 cmd.CommandText =
                     "INSERT INTO accounts(email, qty) VALUES ('b@example.com', 7) " +
                     "RETURNING id, doubled";
-                await using var rdr = await cmd.ExecuteReaderAsync();
-                Assert.True(await rdr.ReadAsync());
+                await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal(3, rdr.GetInt32(0));
                 Assert.Equal(14, rdr.GetInt32(1));
             }
@@ -230,14 +230,14 @@ public sealed class PostgresFeatureMatrixTests
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM active_rule_source";
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await conn.ExecAsync("INSERT INTO rule_source VALUES (2, false);");
             await using (var cmd = conn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM rule_log WHERE id = 2";
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -396,7 +396,7 @@ public sealed class PostgresFeatureMatrixTests
         cmd.Parameters.AddWithValue("files", files);
         cmd.Parameters.AddWithValue("target", target);
         cmd.CommandTimeout = 300;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         NpgsqlConnection.ClearAllPools();
     }
 }

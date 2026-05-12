@@ -34,7 +34,7 @@ public sealed class RestoreSimpleTests
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 60;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -43,7 +43,7 @@ public sealed class RestoreSimpleTests
             await using var c = conn.CreateCommand();
             c.CommandText = "SELECT count(*) FROM widgets";
             c.CommandTimeout = 30;
-            var n = (long)(await c.ExecuteScalarAsync())!;
+            var n = (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(100L, n);
         }
         finally
@@ -70,7 +70,7 @@ public sealed class RestoreSimpleTests
         await using (var create = admin.CreateCommand())
         {
             create.CommandText = $"CREATE DATABASE \"{target}\"";
-            await create.ExecuteNonQueryAsync();
+            await create.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         try
@@ -82,7 +82,7 @@ public sealed class RestoreSimpleTests
                     Pooling = false,
                 };
                 await using var preconn = new NpgsqlConnection(builder.ConnectionString);
-                await preconn.OpenAsync();
+                await preconn.OpenAsync(TestContext.Current.CancellationToken);
                 await preconn.ExecAsync(
                     "CREATE TABLE bar(x int, payload text); " +
                     "INSERT INTO bar VALUES (99, 'gone');");
@@ -98,7 +98,7 @@ public sealed class RestoreSimpleTests
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 60;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             NpgsqlConnection.ClearAllPools();
@@ -108,7 +108,7 @@ public sealed class RestoreSimpleTests
             {
                 c.CommandText = "SELECT count(*) FROM foo";
                 c.CommandTimeout = 30;
-                Assert.Equal(5L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(5L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var c = conn.CreateCommand())
@@ -116,7 +116,7 @@ public sealed class RestoreSimpleTests
                 c.CommandText =
                     "SELECT count(*) FROM pg_class WHERE relname = 'bar' AND relkind = 'r'";
                 c.CommandTimeout = 30;
-                Assert.Equal(0L, (long)(await c.ExecuteScalarAsync())!);
+                Assert.Equal(0L, (long)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -149,7 +149,7 @@ public sealed class RestoreSimpleTests
             cmd.Parameters.AddWithValue("pw", "wrong");
 
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
         }
         finally
         {
@@ -185,7 +185,7 @@ public sealed class RestoreSimpleTests
             cmd.Parameters.AddWithValue("tgt", target);
 
             await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
         }
 
         Assert.False(await _pg.DbExistsAsync(target),
@@ -196,7 +196,7 @@ public sealed class RestoreSimpleTests
         {
             cmd.CommandText =
                 "SELECT count(*) FROM pg_database WHERE datname LIKE '_pg_dbbackup_restore_%'";
-            var n = (long)(await cmd.ExecuteScalarAsync())!;
+            var n = (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
             Assert.Equal(0L, n);
         }
     }

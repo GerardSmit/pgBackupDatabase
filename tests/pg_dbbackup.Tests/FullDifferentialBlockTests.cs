@@ -79,16 +79,16 @@ public sealed class FullDifferentialLogicalTests
                 cmd.Parameters.AddWithValue("p2", diffPath);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             await using var rconn = await _pg.ConnectToAsync(target);
             await using var q = rconn.CreateCommand();
             q.CommandText =
                 "SELECT id, v FROM diff_roundtrip ORDER BY id";
-            await using var rdr = await q.ExecuteReaderAsync();
+            await using var rdr = await q.ExecuteReaderAsync(TestContext.Current.CancellationToken);
             var vals = new List<(int id, string v)>();
-            while (await rdr.ReadAsync())
+            while (await rdr.ReadAsync(TestContext.Current.CancellationToken))
                 vals.Add((rdr.GetInt32(0), rdr.GetString(1)));
 
             Assert.Equal(new[] { (2, "changed"), (3, "orig3"), (4, "late") }, vals);
@@ -133,13 +133,13 @@ public sealed class FullDifferentialLogicalTests
                 cmd.Parameters.AddWithValue("p2", diffPath);
                 cmd.Parameters.AddWithValue("tgt", target);
                 cmd.CommandTimeout = 120;
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             await using var rconn = await _pg.ConnectToAsync(target);
             await using var q = rconn.CreateCommand();
             q.CommandText = "SELECT v FROM empty_diff WHERE id = 1";
-            Assert.Equal("stable", await q.ExecuteScalarAsync());
+            Assert.Equal("stable", await q.ExecuteScalarAsync(TestContext.Current.CancellationToken));
         }
         finally
         {

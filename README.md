@@ -1,5 +1,8 @@
 # pg_dbbackup
 
+<!-- TODO: replace OWNER/REPO with the actual GitHub slug once the repo is pushed -->
+[![CI](https://github.com/OWNER/REPO/actions/workflows/ci.yml/badge.svg)](https://github.com/OWNER/REPO/actions/workflows/ci.yml)
+
 `pg_dbbackup` is a PostgreSQL 17 extension that performs **per-database**
 online backups in two recovery models (`SIMPLE`, `FULL`) and three backup
 types (`FULL`, `DIFFERENTIAL`, `LOG`), modelled on SQL Server's
@@ -50,7 +53,7 @@ sudo make install
 ```
 
 This installs the shared library next to other PG modules and copies
-`pg_dbbackup.control` plus `sql/pg_dbbackup--1.0.0.sql` into
+`pg_dbbackup.control` plus `sql/pg_dbbackup--0.0.1.sql` into
 `pg_config --sharedir`/extension.
 
 ### Cluster configuration
@@ -76,11 +79,27 @@ If a promoted primary does not have a persistent synced `_pg_dbbackup_<dboid>`
 slot, LOG/DIFFERENTIAL backup refuses to continue and you must take a new FULL
 backup.
 
-When using PgDog or another SQL proxy, backup jobs must be routed to the
-primary endpoint. `pg_dbbackup` does not reroute a request that reaches a hot
-standby; PostgreSQL rejects the write/slot work there. PgDog primary routing is
-tested, and a PgDog route pointed at the standby is expected to fail instead of
-silently forwarding the backup.
+When `dbbackup.pg_dbbackup_to_storage()` is called on a hot standby, the
+extension automatically re-issues the call on the primary using PostgreSQL's
+own `primary_conninfo` GUC. The standby opens a libpq connection to the
+primary, sets `dbbackup.in_remote_invocation = on` on it as a recursion guard,
+and forwards the call verbatim. The backup itself — slot work, journal reads,
+S3 upload — runs on the primary; the standby returns the routed `backup_id`.
+
+For this to work, `primary_conninfo` must be set on the standby (the usual
+streaming-replication setup already satisfies this) and the credentials it
+carries must be accepted by the primary's `pg_hba.conf`. If `primary_conninfo`
+is empty, the call fails with `object_not_in_prerequisite_state` and a hint
+pointing at the GUC.
+
+`dbbackup.pg_dbbackup()` (local-file output) is **rejected** on a standby with
+`read_only_sql_transaction` because the `.bak` would land on the primary's
+filesystem, not the caller's. Use `pg_dbbackup_to_storage()` so the artifact
+ends up in shared storage where the location is unambiguous.
+
+With PgDog or another SQL proxy: a standby-routed call to
+`pg_dbbackup_to_storage()` now succeeds (auto-routed by the extension); a
+standby-routed call to `pg_dbbackup()` still fails — by design.
 
 SIMPLE mode does not need logical decoding, but using the same preload setting
 in test/dev clusters is fine.
@@ -207,9 +226,13 @@ SELECT * FROM dbbackup.pg_dbbackup_verify('/var/backups/app-...-full.bak');
   a persistent synced slot. LOG/DIFFERENTIAL backup refuses to continue if the
   chain slot is missing, temporary, invalidated, or recreated without failover
   support.
-- **PgDog/proxy backup routes must target primary.** Backup through a PgDog
-  primary route is tested. A route that reaches a standby fails; the extension
-  deliberately does not proxy the request to primary from inside PostgreSQL.
+- **Standby calls auto-route to the primary.** When invoked on a hot standby,
+  `pg_dbbackup_to_storage` opens a libpq connection to the primary using
+  `primary_conninfo` and re-issues the call there with the recursion-guard GUC
+  `dbbackup.in_remote_invocation = on`. `pg_dbbackup` (local-file output) is
+  rejected on a standby because the artifact would land on the primary's
+  filesystem. PgDog/proxy primary and standby routes for the storage entry are
+  both tested.
 - **DDL is captured through event triggers.** The v1 path journals
   `ddl_command_end` and `sql_drop` command text and replays it in logical
   transaction order. Newly found DDL command families should get tests or an
@@ -231,6 +254,87 @@ SELECT * FROM dbbackup.pg_dbbackup_verify('/var/backups/app-...-full.bak');
   `COPY FROM` in chunks. zstd/AES sections are still processed as whole
   section blobs, and the footer checksum currently rereads the finished
   `.bak`.
+
+## Disaster recovery runbook
+
+These procedures cover the cases that show up in practice. All commands
+assume superuser, connected to the database whose chain is being
+repaired unless noted otherwise.
+
+### Inspecting chain state
+
+`dbbackup.logical_chains` records the FULL-mode chain endpoint per
+database:
+
+```sql
+SELECT db_name, slot_name, confirmed_lsn, updated_at
+FROM dbbackup.logical_chains
+WHERE db_oid = (SELECT oid FROM pg_database WHERE datname = current_database());
+
+SELECT slot_name, slot_type, plugin, confirmed_flush_lsn, restart_lsn,
+       invalidation_reason
+FROM pg_replication_slots
+WHERE slot_name LIKE '\_pg\_dbbackup\_%';
+```
+
+`logical_chains.confirmed_lsn` must equal the `stop_lsn` of the most
+recent `.bak` in the chain (see `dbbackup.pg_dbbackup_header(path)`)
+and must be **≤** `pg_replication_slots.confirmed_flush_lsn` for that
+slot. The next DIFFERENTIAL/LOG backup reconciles slot.confirmed_flush_lsn
+forward to logical_chains.confirmed_lsn automatically; legacy state where
+the slot is ahead of the chain (an upgrade artifact) requires manual
+intervention — take a fresh FULL backup.
+
+### A backup crashed mid-write
+
+If the backend died while writing a `.bak` and the file is partial,
+delete the partial file. The chain row is only updated on success, so
+the next DIFFERENTIAL/LOG against the previous good `.bak` will pick
+up where it left off.
+
+### `previous backup does not match the active logical PITR chain`
+
+Raised when `base_filepath`'s `stop_lsn` differs from
+`logical_chains.confirmed_lsn`. Either the supplied base is older than
+the most recent successful chain entry (use the latest `.bak` instead),
+or someone has hand-edited `logical_chains`. If you have lost the
+intermediate `.bak` files, take a new FULL backup — there is no way to
+synthesize the gap from WAL alone.
+
+### `logical PITR slot "..." is invalidated`
+
+The replication slot was invalidated by Postgres (typically because of
+`max_slot_wal_keep_size`). LOG/DIFFERENTIAL backups cannot continue.
+Take a new FULL backup; the extension will drop the invalidated slot
+and create a fresh one.
+
+### A `.bak` is corrupted
+
+`dbbackup.pg_dbbackup_verify(path)` checks magic bytes and the SHA-256
+footer. If verification fails, the file is unusable; restore the chain
+up to the previous good `.bak` and take a new FULL.
+
+### A restore failed partway
+
+The restore writes to `_pg_dbbackup_restore_<16hex>` and only renames
+over the target on success. If the restore aborted, the target
+database is untouched. Stale temp DBs are dropped automatically on the
+next restore attempt; to clean them up manually:
+
+```sql
+SELECT format('DROP DATABASE %I WITH (FORCE)', datname)
+FROM pg_database
+WHERE datname LIKE '\_pg\_dbbackup\_restore\_%';
+```
+
+### A slot is stuck after manual cleanup
+
+If you have proven the slot is no longer needed (e.g., the chain row
+was deleted and you have no `.bak` that references it),
+`SELECT pg_drop_replication_slot('_pg_dbbackup_<oid>');` removes it.
+**Do not drop a slot whose `confirmed_flush_lsn` exceeds the last
+`.bak`'s `stop_lsn`** — WAL behind that LSN will be reclaimed and any
+in-flight backup attempt will fail with a chain-LSN-gap error.
 
 ## Tests
 

@@ -42,7 +42,7 @@ public sealed class FullRestoreChainTests
             cmd.CommandTimeout = 120;
 
             // Should succeed without errors at the chain/file level.
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
         finally
         {
@@ -120,7 +120,7 @@ public sealed class FullRestoreChainTests
             cmd.Parameters.AddWithValue("tgt", target);
 
             var ex = await Assert.ThrowsAsync<PostgresException>(
-                () => cmd.ExecuteNonQueryAsync());
+                () => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
             Assert.Contains("LSN gap", ex.MessageText,
                 StringComparison.OrdinalIgnoreCase);
         }

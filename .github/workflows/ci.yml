@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [17, 18]
+    env:
+      PG_DBBACKUP_PG_VERSION: ${{ matrix.pg }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ matrix.pg }} dev headers + deps
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-server-dev-${{ matrix.pg }} \
+            libzstd-dev libssl-dev libcurl4-openssl-dev build-essential
+
+      - name: Build + install extension (host smoke)
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          make -j"$(nproc)"
+          sudo make install
+
+      - name: Stage release artifact
+        run: |
+          export PG_CONFIG=/usr/lib/postgresql/${{ matrix.pg }}/bin/pg_config
+          rm -rf stage
+          make install DESTDIR="$PWD/stage"
+          version=$(grep "^default_version" pg_dbbackup.control | sed -E "s/.*'([^']+)'.*/\1/")
+          tar -czf "pg_dbbackup-${version}-pg${{ matrix.pg }}-linux-amd64.tar.gz" -C stage .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pg_dbbackup-pg${{ matrix.pg }}
+          path: pg_dbbackup-*-pg${{ matrix.pg }}-linux-amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Run tests
+        working-directory: tests/pg_dbbackup.Tests
+        run: dotnet test --logger "console;verbosity=normal"
+
+  release:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: version
+        name: Resolve version from pg_dbbackup.control
+        run: |
+          v=$(grep "^default_version" pg_dbbackup.control | sed -E "s/.*'([^']+)'.*/\1/")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+
+      - id: tag_check
+        name: Check whether tag already exists
+        run: |
+          if git rev-parse "refs/tags/${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Tag ${{ steps.version.outputs.tag }} already exists - skipping release."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.tag_check.outputs.exists == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: pg_dbbackup-pg*
+          merge-multiple: true
+
+      - if: steps.tag_check.outputs.exists == 'false'
+        name: Create tag + GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --title "pg_dbbackup ${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            artifacts/*.tar.gz

@@ -29,7 +29,7 @@ public sealed class AsyncBackupTests
             Value = (object?)basePath ?? DBNull.Value,
         });
         cmd.CommandTimeout = 30;
-        return (Guid)(await cmd.ExecuteScalarAsync())!;
+        return (Guid)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
     }
 
     private static async Task<(string status, int progress, string? err,
@@ -39,8 +39,8 @@ public sealed class AsyncBackupTests
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT * FROM dbbackup.pg_dbbackup_status(@id)";
         cmd.Parameters.AddWithValue("id", id);
-        await using var reader = await cmd.ExecuteReaderAsync();
-        if (!await reader.ReadAsync())
+        await using var reader = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+        if (!await reader.ReadAsync(TestContext.Current.CancellationToken))
             throw new InvalidOperationException($"no status row for {id}");
         var status = reader.GetString(0);
         var progress = reader.GetInt32(1);
@@ -60,7 +60,7 @@ public sealed class AsyncBackupTests
         {
             var s = await GetStatusAsync(conn, id);
             if (s.status is "completed" or "failed") return s.status;
-            await Task.Delay(100);
+            await Task.Delay(100, TestContext.Current.CancellationToken);
         }
         throw new TimeoutException(
             $"job {id} did not finish within {timeout}");
@@ -112,7 +112,7 @@ public sealed class AsyncBackupTests
         await using var verify = conn.CreateCommand();
         verify.CommandText = "SELECT is_valid FROM dbbackup.pg_dbbackup_verify(@p)";
         verify.Parameters.AddWithValue("p", path);
-        var ok = (bool)(await verify.ExecuteScalarAsync())!;
+        var ok = (bool)(await verify.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         Assert.True(ok, "backup file should pass verify");
     }
 
@@ -131,7 +131,7 @@ public sealed class AsyncBackupTests
         cmd.CommandText = "SELECT dbbackup.pg_dbbackup_wait(@id, 90)";
         cmd.Parameters.AddWithValue("id", id);
         cmd.CommandTimeout = 120;
-        var status = (string)(await cmd.ExecuteScalarAsync())!;
+        var status = (string)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         Assert.Equal("completed", status);
     }
 
@@ -151,7 +151,7 @@ public sealed class AsyncBackupTests
                 " 'running', 5)";
             insert.Parameters.AddWithValue("id", id);
             insert.Parameters.AddWithValue("db", conn.Database!);
-            await insert.ExecuteNonQueryAsync();
+            await insert.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         await using var cmd = conn.CreateCommand();
@@ -159,7 +159,7 @@ public sealed class AsyncBackupTests
         cmd.Parameters.AddWithValue("id", id);
         cmd.CommandTimeout = 30;
         var sw = Stopwatch.StartNew();
-        var status = (string)(await cmd.ExecuteScalarAsync())!;
+        var status = (string)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         sw.Stop();
 
         Assert.True(status is "pending" or "running",

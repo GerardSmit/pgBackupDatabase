@@ -23,7 +23,7 @@ public sealed class CrossContainerRestoreTests
         await using (var cmd = admin.CreateCommand())
         {
             cmd.CommandText = $"CREATE ROLE \"{roleName}\"";
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         var fullPath = Helpers.BackupPath("cross_container_full");
@@ -69,7 +69,7 @@ public sealed class CrossContainerRestoreTests
             await using (var cmd = restored.CreateCommand())
             {
                 cmd.CommandText = "SELECT array_agg(code ORDER BY id) FROM app.items";
-                Assert.Equal(new[] { "full", "log" }, (string[])(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(new[] { "full", "log" }, (string[])(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = restored.CreateCommand())
@@ -77,7 +77,7 @@ public sealed class CrossContainerRestoreTests
                 cmd.CommandText =
                     "SELECT count(*) FROM pg_indexes " +
                     "WHERE schemaname = 'app' AND indexname = 'items_code_idx'";
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = restored.CreateCommand())
@@ -86,20 +86,20 @@ public sealed class CrossContainerRestoreTests
                     "SELECT pg_get_userbyid(c.relowner) " +
                     "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace " +
                     "WHERE n.nspname = 'app' AND c.relname = 'items'";
-                Assert.Equal(roleName, (string)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(roleName, (string)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = restored.CreateCommand())
             {
                 cmd.CommandText = "SELECT has_table_privilege(@role, 'app.items', 'SELECT')";
                 cmd.Parameters.AddWithValue("role", roleName);
-                Assert.True((bool)(await cmd.ExecuteScalarAsync())!);
+                Assert.True((bool)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = restored.CreateCommand())
             {
                 cmd.CommandText = "SELECT gen_random_uuid() IS NOT NULL";
-                Assert.True((bool)(await cmd.ExecuteScalarAsync())!);
+                Assert.True((bool)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -112,7 +112,7 @@ public sealed class CrossContainerRestoreTests
             await using var admin = await _pg.AdminAsync();
             await using var cmd = admin.CreateCommand();
             cmd.CommandText = $"DROP ROLE IF EXISTS \"{roleName}\"";
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
     }
 
@@ -129,13 +129,13 @@ public sealed class CrossContainerRestoreTests
         cmd.Parameters.AddWithValue("files", files);
         cmd.Parameters.AddWithValue("target", targetDb);
         cmd.CommandTimeout = 300;
-        await cmd.ExecuteNonQueryAsync();
+        await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         NpgsqlConnection.ClearAllPools();
     }
 
     private sealed class SecondaryPgContainer : IAsyncDisposable
     {
-        private const string PostgresImage = "postgres:17";
+        private static string PostgresImage => Helpers.PostgresImage;
         private const string PostgresUser = "postgres";
         private const string PostgresPassword = "postgres";
         private const string PostgresDb = "postgres";
@@ -151,9 +151,8 @@ public sealed class CrossContainerRestoreTests
 
         public static async Task<SecondaryPgContainer> StartAsync()
         {
-            var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, "17");
-            var container = new PostgreSqlBuilder()
-                .WithImage(image)
+            var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, Helpers.PgMajor);
+            var container = new PostgreSqlBuilder(image)
                 .WithUsername(PostgresUser)
                 .WithPassword(PostgresPassword)
                 .WithDatabase(PostgresDb)
@@ -170,7 +169,7 @@ public sealed class CrossContainerRestoreTests
                 .Build();
 
             var wrapper = new SecondaryPgContainer(container);
-            await container.StartAsync();
+            await container.StartAsync(TestContext.Current.CancellationToken);
             await wrapper.WaitForReadyConnectionAsync();
             await wrapper.EnsureExtensionInPostgresDbAsync();
             return wrapper;
@@ -184,7 +183,7 @@ public sealed class CrossContainerRestoreTests
         public async Task<NpgsqlConnection> AdminAsync()
         {
             var conn = new NpgsqlConnection(ConnectionString);
-            await conn.OpenAsync();
+            await conn.OpenAsync(TestContext.Current.CancellationToken);
             return conn;
         }
 
@@ -195,7 +194,7 @@ public sealed class CrossContainerRestoreTests
                 Database = dbName,
             };
             var conn = new NpgsqlConnection(builder.ConnectionString);
-            await conn.OpenAsync();
+            await conn.OpenAsync(TestContext.Current.CancellationToken);
             return conn;
         }
 
@@ -220,7 +219,7 @@ public sealed class CrossContainerRestoreTests
             await using var conn = await AdminAsync();
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_dbbackup";
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
 
         private async Task WaitForReadyConnectionAsync()
@@ -234,13 +233,13 @@ public sealed class CrossContainerRestoreTests
                     await using var conn = await AdminAsync();
                     await using var cmd = conn.CreateCommand();
                     cmd.CommandText = "SELECT 1";
-                    await cmd.ExecuteScalarAsync();
+                    await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
                     return;
                 }
                 catch (Exception e)
                 {
                     last = e;
-                    await Task.Delay(1000);
+                    await Task.Delay(1000, TestContext.Current.CancellationToken);
                 }
             }
 

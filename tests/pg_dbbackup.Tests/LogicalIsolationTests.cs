@@ -27,7 +27,7 @@ public sealed class LogicalIsolationTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText = $"CREATE DATABASE \"{otherDb}\"";
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             await using (var other = await _pg.ConnectToAsync(otherDb))
@@ -74,7 +74,7 @@ public sealed class LogicalIsolationTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText = $"CREATE DATABASE \"{otherDb}\"";
-                await cmd.ExecuteNonQueryAsync();
+                await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
             }
 
             await using (var other = await _pg.ConnectToAsync(otherDb))

@@ -29,7 +29,7 @@ public sealed class TimescaleDbTests
         cmd.CommandTimeout = 300;
         try
         {
-            await cmd.ExecuteNonQueryAsync();
+            await cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken);
         }
         catch (Exception ex)
         {
@@ -70,7 +70,7 @@ public sealed class TimescaleDbTests
         await using var c = src.CreateCommand();
         c.CommandText = "SELECT (dbbackup.pg_dbbackup_verify(@p)).is_valid";
         c.Parameters.AddWithValue("p", path);
-        var ok = (bool)(await c.ExecuteScalarAsync())!;
+        var ok = (bool)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         Assert.True(ok, ".bak should verify after TimescaleDB hypertable backup");
     }
 
@@ -112,7 +112,7 @@ public sealed class TimescaleDbTests
             {
                 cmd.CommandText = "SELECT count(*) FROM sensor_data";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
@@ -121,7 +121,7 @@ public sealed class TimescaleDbTests
                     "SELECT count(*) FROM timescaledb_information.hypertables " +
                     "WHERE hypertable_name = 'sensor_data'";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
@@ -130,7 +130,7 @@ public sealed class TimescaleDbTests
                     "SELECT count(*) FROM timescaledb_information.chunks " +
                     "WHERE hypertable_name = 'sensor_data'";
                 cmd.CommandTimeout = 60;
-                var chunkCount = (long)(await cmd.ExecuteScalarAsync())!;
+                var chunkCount = (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.True(chunkCount > 0,
                     "expected at least one chunk after migrate_data");
             }
@@ -180,7 +180,7 @@ public sealed class TimescaleDbTests
                 "SELECT count(*) FROM timescaledb_information.chunks " +
                 "WHERE hypertable_name='sensor_data' AND is_compressed";
             cmd.CommandTimeout = 60;
-            srcCompressed = (long)(await cmd.ExecuteScalarAsync())!;
+            srcCompressed = (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
         Assert.True(srcCompressed > 0,
             "source must have at least one compressed chunk before backup");
@@ -199,7 +199,7 @@ public sealed class TimescaleDbTests
             {
                 cmd.CommandText = "SELECT count(*) FROM sensor_data";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
@@ -208,7 +208,7 @@ public sealed class TimescaleDbTests
                     "SELECT compression_enabled FROM timescaledb_information.hypertables " +
                     "WHERE hypertable_name = 'sensor_data'";
                 cmd.CommandTimeout = 60;
-                var enabled = (bool)(await cmd.ExecuteScalarAsync())!;
+                var enabled = (bool)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
                 Assert.True(enabled,
                     "restored hypertable must have compression enabled");
             }
@@ -258,7 +258,7 @@ public sealed class TimescaleDbTests
             {
                 cmd.CommandText = "SELECT count(*) FROM sensor_multi";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
@@ -270,7 +270,7 @@ public sealed class TimescaleDbTests
                     "  ON h.id = d.hypertable_id " +
                     "WHERE h.table_name = 'sensor_multi'";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(2L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -331,7 +331,7 @@ public sealed class TimescaleDbTests
                     "  'policy_compression', " +
                     "  'policy_refresh_continuous_aggregate')";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(3L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(3L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -376,7 +376,7 @@ public sealed class TimescaleDbTests
         {
             cmd.CommandText = "SELECT count(*) FROM metrics_hourly";
             cmd.CommandTimeout = 60;
-            srcCaggRows = (long)(await cmd.ExecuteScalarAsync())!;
+            srcCaggRows = (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
         Assert.True(srcCaggRows > 0,
             "source CAGG must contain rows before backup");
@@ -395,7 +395,7 @@ public sealed class TimescaleDbTests
             {
                 cmd.CommandText = "SELECT count(*) FROM metrics";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(100L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
@@ -404,14 +404,14 @@ public sealed class TimescaleDbTests
                     "SELECT count(*) FROM timescaledb_information.continuous_aggregates " +
                     "WHERE view_name = 'metrics_hourly'";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
 
             await using (var cmd = rconn.CreateCommand())
             {
                 cmd.CommandText = "SELECT count(*) FROM metrics_hourly";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(srcCaggRows, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(srcCaggRows, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -434,7 +434,7 @@ public sealed class TimescaleDbTests
         await using (var cmd = src.CreateCommand())
         {
             cmd.CommandText = "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'";
-            srcVersion = (string?)await cmd.ExecuteScalarAsync();
+            srcVersion = (string?)await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
         }
         Assert.False(string.IsNullOrEmpty(srcVersion),
             "timescaledb extension must have a version in source");
@@ -463,7 +463,7 @@ public sealed class TimescaleDbTests
             await using var cmd = rconn.CreateCommand();
             cmd.CommandText = "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'";
             cmd.CommandTimeout = 60;
-            var restoredVersion = (string?)await cmd.ExecuteScalarAsync();
+            var restoredVersion = (string?)await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken);
             Assert.Equal(srcVersion, restoredVersion);
         }
         finally
@@ -520,8 +520,8 @@ public sealed class TimescaleDbTests
             {
                 cmd.CommandText = "SELECT count(*), max(value) FROM sensor_log";
                 cmd.CommandTimeout = 60;
-                await using var rdr = await cmd.ExecuteReaderAsync();
-                Assert.True(await rdr.ReadAsync());
+                await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
                 Assert.Equal(48L, rdr.GetInt64(0));
                 Assert.Equal(123d, rdr.GetDouble(1));
             }
@@ -532,7 +532,7 @@ public sealed class TimescaleDbTests
                     "SELECT count(*) FROM timescaledb_information.hypertables " +
                     "WHERE hypertable_name = 'sensor_log'";
                 cmd.CommandTimeout = 60;
-                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync())!);
+                Assert.Equal(1L, (long)(await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
             }
         }
         finally
@@ -568,7 +568,7 @@ public sealed class TimescaleDbTests
         var fullPath = Helpers.BackupPath("tsdb_pitr");
         await src.BackupFullAsync(fullPath, compress: true, commandTimeoutSeconds: 300);
 
-        await Task.Delay(1200);
+        await Task.Delay(1200, TestContext.Current.CancellationToken);
         await src.ExecAsync(
             "INSERT INTO metrics_log VALUES " +
             "('2025-02-02 00:00+00', 1, 10);", timeoutSeconds: 60);
@@ -577,10 +577,10 @@ public sealed class TimescaleDbTests
         await using (var c = src.CreateCommand())
         {
             c.CommandText = "SELECT clock_timestamp()";
-            cutoff = (DateTime)(await c.ExecuteScalarAsync())!;
+            cutoff = (DateTime)(await c.ExecuteScalarAsync(TestContext.Current.CancellationToken))!;
         }
 
-        await Task.Delay(1200);
+        await Task.Delay(1200, TestContext.Current.CancellationToken);
         await src.ExecAsync(
             "INSERT INTO metrics_log VALUES " +
             "('2025-02-03 00:00+00', 1, 99);", timeoutSeconds: 60);
@@ -597,8 +597,8 @@ public sealed class TimescaleDbTests
             await using var cmd = rconn.CreateCommand();
             cmd.CommandText = "SELECT count(*), max(value) FROM metrics_log";
             cmd.CommandTimeout = 60;
-            await using var rdr = await cmd.ExecuteReaderAsync();
-            Assert.True(await rdr.ReadAsync());
+            await using var rdr = await cmd.ExecuteReaderAsync(TestContext.Current.CancellationToken);
+            Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
             Assert.Equal(3L, rdr.GetInt64(0));
             Assert.Equal(10d, rdr.GetDouble(1));
         }

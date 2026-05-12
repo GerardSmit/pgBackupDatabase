@@ -16,7 +16,7 @@ internal sealed class ImmediateReadyWait : IWaitUntil
 
 public sealed class PgContainerFixture : IAsyncLifetime
 {
-    private const string PostgresImage = "postgres:17";
+    private static string PostgresImage => Helpers.PostgresImage;
     private const string PostgresUser = "postgres";
     private const string PostgresPassword = "postgres";
     private const string PostgresDb = "postgres";
@@ -29,10 +29,9 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
     public async ValueTask InitializeAsync()
     {
-        var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, "17");
+        var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, Helpers.PgMajor);
 
-        _container = new PostgreSqlBuilder()
-            .WithImage(image)
+        _container = new PostgreSqlBuilder(image)
             .WithUsername(PostgresUser)
             .WithPassword(PostgresPassword)
             .WithDatabase(PostgresDb)
@@ -48,7 +47,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
                 .AddCustomWaitStrategy(new ImmediateReadyWait()))
             .Build();
 
-        await _container.StartAsync();
+        await _container.StartAsync(TestContext.Current.CancellationToken);
         await WaitForReadyConnectionAsync();
         await EnsureExtensionInPostgresDbAsync();
     }
@@ -56,7 +55,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
     private async Task EnsureExtensionInPostgresDbAsync()
     {
         await using var conn = CreateConnection();
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         await using var cmd = conn.CreateCommand();
         cmd.CommandText = "CREATE EXTENSION IF NOT EXISTS pg_dbbackup";
         await cmd.ExecuteNonQueryAsync();
@@ -75,7 +74,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
     public async Task<NpgsqlConnection> AdminAsync()
     {
         var conn = CreateConnection();
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -86,7 +85,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
             Database = dbName,
         };
         var conn = new NpgsqlConnection(builder.ConnectionString);
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         return conn;
     }
 
@@ -116,7 +115,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
         await using (var admin = CreateConnection())
         {
-            await admin.OpenAsync();
+            await admin.OpenAsync(TestContext.Current.CancellationToken);
             await using var cmd = admin.CreateCommand();
             cmd.CommandText = $"CREATE DATABASE \"{dbName}\"";
             await cmd.ExecuteNonQueryAsync();
@@ -124,7 +123,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
         var builder = new NpgsqlConnectionStringBuilder(ConnectionString) { Database = dbName };
         var conn = new NpgsqlConnection(builder.ConnectionString);
-        await conn.OpenAsync();
+        await conn.OpenAsync(TestContext.Current.CancellationToken);
         await using (var cmd = conn.CreateCommand())
         {
             cmd.CommandText = "CREATE EXTENSION pg_dbbackup";
@@ -226,7 +225,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
             try
             {
                 await using var c = CreateConnection();
-                await c.OpenAsync();
+                await c.OpenAsync(TestContext.Current.CancellationToken);
                 await using var cmd = c.CreateCommand();
                 cmd.CommandText = "SELECT 1";
                 await cmd.ExecuteScalarAsync();
@@ -235,7 +234,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
             catch (Exception e)
             {
                 last = e;
-                await Task.Delay(1000);
+                await Task.Delay(1000, TestContext.Current.CancellationToken);
             }
         }
 
@@ -258,7 +257,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
     public async Task<ExecResult> ShellAsync(string command)
     {
         var raw = await _container.ExecAsync(new[] { "sh", "-c", command });
-        return new ExecResult(raw.ExitCode, raw.Stdout ?? string.Empty, raw.Stderr ?? string.Empty);
+        return new ExecResult(raw.ExitCode ?? -1L, raw.Stdout ?? string.Empty, raw.Stderr ?? string.Empty);
     }
 
     public async Task<byte[]> ReadContainerFileAsync(string containerPath)
