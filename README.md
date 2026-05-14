@@ -17,8 +17,7 @@ optional AES-256-GCM encryption.
 - Atomic restore: writes to temp DB, then renames over the target
 
 🚀 **Status**: v0.0.1. `SIMPLE` is feature-complete. `FULL` covers per-database
-logical PITR. See [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the
-detailed feature matrix.
+logical PITR. See the [Feature Matrix](#feature-matrix) below.
 
 ## PostgreSQL Version Compatibility
 
@@ -404,9 +403,11 @@ SELECT pg_drop_replication_slot('_pg_dbbackup_<oid>');
 - **DDL is captured through event triggers.** The v1 path journals
   `ddl_command_end` and `sql_drop` command text. New DDL command families
   need tests or an explicit rejection path.
-- See [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) for the full list of
-  rejected features (unlogged tables, foreign tables, materialized views,
-  publications/subscriptions, custom range types, etc.).
+- **Rejected features** (FULL mode): unlogged tables, foreign tables, regular
+  materialized views, ordinary table inheritance, user event triggers, custom
+  range/base/pseudo types, custom text search configs, user aggregates, and
+  logical publications/subscriptions. Backup fails before writing a misleading
+  `.bak`.
 
 ## Tests
 
