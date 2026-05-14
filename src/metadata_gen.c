@@ -565,6 +565,181 @@ metadata_gen_comments(Oid db_oid)
 		}
 	}
 
+	/* Column comments. */
+	ret = SPI_execute(
+		"SELECT n.nspname, c.relname, a.attname, d.description "
+		"FROM pg_description d "
+		"JOIN pg_class c ON d.objoid = c.oid "
+		"  AND d.classoid = 'pg_class'::regclass "
+		"JOIN pg_namespace n ON c.relnamespace = n.oid "
+		"JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = d.objsubid "
+		"WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"  AND d.objsubid > 0 AND NOT a.attisdropped "
+		"ORDER BY n.nspname, c.relname, a.attnum",
+		true, 0);
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *relname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+			char	   *colname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 3);
+			char	   *descr = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 4);
+
+			if (nspname == NULL || relname == NULL ||
+				colname == NULL || descr == NULL)
+				continue;
+			appendStringInfo(result,
+							 "COMMENT ON COLUMN %s.%s.%s IS %s;\n",
+							 quote_identifier(nspname),
+							 quote_identifier(relname),
+							 quote_identifier(colname),
+							 quote_literal_cstr(descr));
+		}
+	}
+
+	/* Schema comments. */
+	ret = SPI_execute(
+		"SELECT n.nspname, d.description "
+		"FROM pg_description d "
+		"JOIN pg_namespace n ON d.objoid = n.oid "
+		"  AND d.classoid = 'pg_namespace'::regclass "
+		"WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"ORDER BY n.nspname",
+		true, 0);
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *descr = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 2);
+
+			if (nspname == NULL || descr == NULL)
+				continue;
+			appendStringInfo(result,
+							 "COMMENT ON SCHEMA %s IS %s;\n",
+							 quote_identifier(nspname),
+							 quote_literal_cstr(descr));
+		}
+	}
+
+	/* Type comments (non-relation types). */
+	ret = SPI_execute(
+		"SELECT n.nspname, t.typname, d.description "
+		"FROM pg_description d "
+		"JOIN pg_type t ON d.objoid = t.oid "
+		"  AND d.classoid = 'pg_type'::regclass "
+		"JOIN pg_namespace n ON t.typnamespace = n.oid "
+		"WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"  AND t.typtype IN ('b','c','d','e','r','p','m') "
+		"  AND NOT EXISTS (SELECT 1 FROM pg_class c WHERE c.reltype = t.oid "
+		"                  AND c.relkind <> 'c') "
+		"  AND NOT EXISTS (SELECT 1 FROM pg_depend dep "
+		"                  WHERE dep.objid = t.oid AND dep.deptype = 'e') "
+		"ORDER BY n.nspname, t.typname",
+		true, 0);
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *typname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+			char	   *descr = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 3);
+
+			if (nspname == NULL || typname == NULL || descr == NULL)
+				continue;
+			appendStringInfo(result,
+							 "COMMENT ON TYPE %s.%s IS %s;\n",
+							 quote_identifier(nspname),
+							 quote_identifier(typname),
+							 quote_literal_cstr(descr));
+		}
+	}
+
+	/* Function / procedure comments. */
+	ret = SPI_execute(
+		"SELECT n.nspname, p.proname, pg_get_function_identity_arguments(p.oid), "
+		"       p.prokind, d.description "
+		"FROM pg_description d "
+		"JOIN pg_proc p ON d.objoid = p.oid "
+		"  AND d.classoid = 'pg_proc'::regclass "
+		"JOIN pg_namespace n ON p.pronamespace = n.oid "
+		"WHERE " SKIP_SYSTEM_NSP_SQL " "
+		"  AND NOT EXISTS (SELECT 1 FROM pg_depend dep "
+		"                  WHERE dep.objid = p.oid AND dep.deptype = 'e') "
+		"ORDER BY n.nspname, p.proname",
+		true, 0);
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *nspname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *proname = SPI_getvalue(SPI_tuptable->vals[i],
+											   SPI_tuptable->tupdesc, 2);
+			char	   *args = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 3);
+			char	   *kind = SPI_getvalue(SPI_tuptable->vals[i],
+											SPI_tuptable->tupdesc, 4);
+			char	   *descr = SPI_getvalue(SPI_tuptable->vals[i],
+											 SPI_tuptable->tupdesc, 5);
+			const char *kwd = "FUNCTION";
+
+			if (nspname == NULL || proname == NULL || descr == NULL ||
+				kind == NULL)
+				continue;
+			if (kind[0] == 'p')
+				kwd = "PROCEDURE";
+			else if (kind[0] == 'a')
+				kwd = "AGGREGATE";
+			appendStringInfo(result,
+							 "COMMENT ON %s %s.%s(%s) IS %s;\n",
+							 kwd,
+							 quote_identifier(nspname),
+							 quote_identifier(proname),
+							 args ? args : "",
+							 quote_literal_cstr(descr));
+		}
+	}
+
+	/* Database comment. */
+	{
+		Oid			argtypes[1] = {OIDOID};
+		Datum		args[1];
+
+		args[0] = ObjectIdGetDatum(db_oid);
+		ret = SPI_execute_with_args(
+			"SELECT d.datname, sd.description "
+			"FROM pg_database d "
+			"LEFT JOIN pg_shdescription sd ON sd.objoid = d.oid "
+			"  AND sd.classoid = 'pg_database'::regclass "
+			"WHERE d.oid = $1 AND sd.description IS NOT NULL",
+			1, argtypes, args, NULL, true, 0);
+		if (ret == SPI_OK_SELECT && SPI_processed == 1)
+		{
+			char	   *datname = SPI_getvalue(SPI_tuptable->vals[0],
+											   SPI_tuptable->tupdesc, 1);
+			char	   *descr = SPI_getvalue(SPI_tuptable->vals[0],
+											 SPI_tuptable->tupdesc, 2);
+			if (datname != NULL && descr != NULL)
+				appendStringInfo(result,
+								 "DO $pg_dbbackup_dbcomment$ BEGIN "
+								 "EXECUTE format('COMMENT ON DATABASE %%I IS %%L', "
+								 "current_database(), %s); "
+								 "END $pg_dbbackup_dbcomment$;\n",
+								 quote_literal_cstr(descr));
+		}
+	}
+
 	SPI_finish();
 	return result;
 }
@@ -610,13 +785,36 @@ metadata_gen_db_settings(Oid db_oid)
 				continue;
 			*eq = '\0';
 
-			appendStringInfo(result, "ALTER DATABASE %s",
-							 quote_identifier(datname));
+			/* Emit via DO block referencing current_database() so the
+			 * setting follows the renamed restore target rather than the
+			 * source database name. */
+			appendStringInfoString(result,
+								   "DO $pg_dbbackup_dbset$ BEGIN ");
 			if (rolename != NULL)
-				appendStringInfo(result, " IN ROLE %s",
-								 quote_identifier(rolename));
-			appendStringInfo(result, " SET %s = %s;\n",
-							 setting, quote_literal_cstr(eq + 1));
+			{
+				/* ALTER ROLE <role> IN DATABASE <db> SET param = value */
+				appendStringInfo(result,
+								 "EXECUTE format($pg_dbbackup_dbset_fmt$"
+								 "ALTER ROLE %s IN DATABASE %%I"
+								 " SET %s = %%L"
+								 "$pg_dbbackup_dbset_fmt$, current_database(), %s);",
+								 quote_identifier(rolename),
+								 setting,
+								 quote_literal_cstr(eq + 1));
+			}
+			else
+			{
+				/* ALTER DATABASE <db> SET param = value */
+				appendStringInfo(result,
+								 "EXECUTE format($pg_dbbackup_dbset_fmt$"
+								 "ALTER DATABASE %%I"
+								 " SET %s = %%L"
+								 "$pg_dbbackup_dbset_fmt$, current_database(), %s);",
+								 setting,
+								 quote_literal_cstr(eq + 1));
+			}
+			appendStringInfoString(result, " END $pg_dbbackup_dbset$;\n");
+			(void) datname;
 		}
 	}
 
@@ -761,6 +959,51 @@ append_timescaledb_policies(StringInfo result)
 				}
 			}
 
+			pfree(qualified.data);
+		}
+	}
+
+	/* User-defined jobs (custom procedures registered via add_job). */
+	ret = SPI_execute(
+		"SELECT j.proc_schema, j.proc_name, j.schedule_interval::text, "
+		"       j.config::text "
+		"FROM _timescaledb_config.bgw_job j "
+		"WHERE j.proc_schema NOT IN ('_timescaledb_internal', "
+		"                            '_timescaledb_functions') "
+		"  AND j.proc_name NOT IN ('policy_retention', "
+		"     'policy_compression', "
+		"     'policy_refresh_continuous_aggregate', "
+		"     'policy_reorder', 'policy_telemetry') "
+		"ORDER BY j.id",
+		true, 0);
+	if (ret == SPI_OK_SELECT)
+	{
+		for (uint64 i = 0; i < SPI_processed; i++)
+		{
+			char	   *proc_schema = SPI_getvalue(SPI_tuptable->vals[i],
+												   SPI_tuptable->tupdesc, 1);
+			char	   *proc_name = SPI_getvalue(SPI_tuptable->vals[i],
+												 SPI_tuptable->tupdesc, 2);
+			char	   *schedule = SPI_getvalue(SPI_tuptable->vals[i],
+												SPI_tuptable->tupdesc, 3);
+			char	   *config = SPI_getvalue(SPI_tuptable->vals[i],
+											  SPI_tuptable->tupdesc, 4);
+			StringInfoData qualified;
+
+			if (proc_schema == NULL || proc_name == NULL || schedule == NULL)
+				continue;
+			initStringInfo(&qualified);
+			appendStringInfo(&qualified, "%s.%s",
+							 quote_identifier(proc_schema),
+							 quote_identifier(proc_name));
+			appendStringInfo(result,
+							 "SELECT public.add_job(%s, INTERVAL %s",
+							 quote_literal_cstr(qualified.data),
+							 quote_literal_cstr(schedule));
+			if (config != NULL)
+				appendStringInfo(result, ", config => %s::jsonb",
+								 quote_literal_cstr(config));
+			appendStringInfoString(result, ");\n");
 			pfree(qualified.data);
 		}
 	}

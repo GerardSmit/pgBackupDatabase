@@ -19,8 +19,8 @@ public sealed class TimescaleDbTests
         await using var admin = await _pg.AdminAsync();
         await using var cmd = admin.CreateCommand();
         cmd.CommandText = stopAt.HasValue
-            ? "SELECT dbbackup.pg_dbrestore(@db, @files::text[], target_db := @tgt, stop_at := @stop)"
-            : "SELECT dbbackup.pg_dbrestore(@db, @files::text[], target_db := @tgt)";
+            ? "SELECT dbbackup.pg_dbrestore(@files::text[], target_db := @tgt, stop_at := @stop)"
+            : "SELECT dbbackup.pg_dbrestore(@files::text[], target_db := @tgt)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("files", paths);
         cmd.Parameters.AddWithValue("tgt", target);

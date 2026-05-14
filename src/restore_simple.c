@@ -14,48 +14,6 @@
 #include "libpq_helpers.h"
 #include "restore_simple.h"
 
-static char *
-libpq_copy_column_list(PGconn *conn, const char *schema,
-					   const char *relname, const char *path)
-{
-	const char *params[2];
-	PGresult   *res;
-	ExecStatusType st;
-	char	   *cols;
-
-	params[0] = schema;
-	params[1] = relname;
-	res = PQexecParams(conn,
-					   "SELECT string_agg(quote_ident(a.attname), ', ' "
-					   "                  ORDER BY a.attnum) "
-					   "FROM pg_class c "
-					   "JOIN pg_namespace n ON c.relnamespace = n.oid "
-					   "JOIN pg_attribute a ON a.attrelid = c.oid "
-					   "WHERE n.nspname = $1 "
-					   "  AND c.relname = $2 "
-					   "  AND a.attnum > 0 "
-					   "  AND NOT a.attisdropped "
-					   "  AND a.attgenerated = ''",
-					   2, NULL, params, NULL, NULL, 0);
-	st = PQresultStatus(res);
-	if (st != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
-		PQgetisnull(res, 0, 0))
-	{
-		char	   *msg = pstrdup(PQerrorMessage(conn));
-
-		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not enumerate restore columns for \"%s\"",
-						path),
-				 errdetail("%s", msg)));
-	}
-
-	cols = pstrdup(PQgetvalue(res, 0, 0));
-	PQclear(res);
-	return cols;
-}
-
 static void
 libpq_copy_in(PGconn *conn, const char *path, const char *data, size_t data_len)
 {
@@ -76,7 +34,7 @@ libpq_copy_in(PGconn *conn, const char *path, const char *data, size_t data_len)
 						path)));
 	schema = pnstrdup(path, dot - path);
 	relname = pstrdup(dot + 1);
-	cols = libpq_copy_column_list(conn, schema, relname, path);
+	cols = pgbu_libpq_copy_column_list(conn, schema, relname, path);
 
 	initStringInfo(&copy_sql);
 	appendStringInfo(&copy_sql,

@@ -63,6 +63,7 @@ typedef struct BakFileWriter
 {
 	FILE	   *fp;
 	char	   *filepath;
+	char	   *temp_filepath;
 	BakFileHeader header;
 	bool		compress;
 	char	   *password;

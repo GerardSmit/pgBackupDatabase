@@ -23,6 +23,8 @@ public sealed class S3StorageFixture : IAsyncLifetime
 
     public string ConnectionString => _postgres.GetConnectionString();
 
+    public IContainer Minio => _minio;
+
     public async ValueTask InitializeAsync()
     {
         var image = await CachedPgDbBackupImage.BuildAsync(PostgresImage, Helpers.PgMajor);

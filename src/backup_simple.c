@@ -18,10 +18,12 @@
 
 #include "backup_simple.h"
 #include "bakfile.h"
+#include "dbbackup_defaults.h"
 #include "metadata_gen.h"
 #include "ddl_gen.h"
+#include "pg_dbbackup.h"
 
-#define COPY_FILE_CHUNK_SIZE (1024 * 1024)
+#define COPY_FILE_CHUNK_SIZE PGDBBACKUP_COPY_CHUNK_SIZE
 
 typedef struct CopyTempFile
 {
@@ -30,64 +32,122 @@ typedef struct CopyTempFile
 	uint8		digest[32];
 } CopyTempFile;
 
+/*
+ * Build a path under PGDATA/base/pgsql_tmp/. This directory is the
+ * default temp area for the cluster's default tablespace, is created
+ * automatically by Postgres, lives on the same filesystem as the data
+ * files (so COPY ... TO doesn't cross a mount boundary), and is owned
+ * by the postgres user on every platform we ship to. Using /tmp would
+ * break on Windows and break SELinux / systemd PrivateTmp setups.
+ *
+ * If creating the directory fails because someone has removed it, we
+ * report the error directly — there is no meaningful fallback.
+ */
 static char *
 make_copy_tempfile_path(void)
 {
 	uint32		r1 = (uint32) random();
 	uint32		r2 = (uint32) random();
+	char	   *dir;
+	char	   *path;
+	struct stat st;
 
-	return psprintf("/tmp/pg_dbbackup_copy_%u_%u.bin", r1, r2);
+	if (DataDir == NULL || DataDir[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("DataDir is not set; cannot stage COPY spool file")));
+
+	dir = psprintf("%s/base/pgsql_tmp", DataDir);
+	if (stat(dir, &st) != 0)
+	{
+		if (errno != ENOENT)
+		{
+			int			save_errno = errno;
+
+			pfree(dir);
+			errno = save_errno;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not stat \"%s\": %m", dir)));
+		}
+		if (MakePGDirectory(dir) < 0 && errno != EEXIST)
+		{
+			int			save_errno = errno;
+
+			pfree(dir);
+			errno = save_errno;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create \"%s\": %m", dir)));
+		}
+	}
+
+	path = psprintf("%s/pg_dbbackup_copy_%u_%u.bin", dir, r1, r2);
+	pfree(dir);
+	return path;
 }
 
 static void
 sha256_file(const char *path, uint8 digest[32])
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
-	FILE	   *fp;
-	char	   *buf;
-	size_t		n;
+	FILE	   *fp = NULL;
+	char	   *buf = NULL;
 
 	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
+	{
+		if (ctx)
+			pg_cryptohash_free(ctx);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not init SHA-256 context")));
+	}
 
-	fp = AllocateFile(path, "rb");
-	if (fp == NULL)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not open COPY output \"%s\": %m", path)));
-
-	buf = palloc(COPY_FILE_CHUNK_SIZE);
-	while ((n = fread(buf, 1, COPY_FILE_CHUNK_SIZE, fp)) > 0)
+	/*
+	 * pg_cryptohash_create wraps an OpenSSL EVP_MD_CTX that isn't tracked
+	 * by Postgres memory contexts; PG_TRY ensures it is released on the
+	 * error paths below before re-throwing.
+	 */
+	PG_TRY();
 	{
-		CHECK_FOR_INTERRUPTS();
-		if (pg_cryptohash_update(ctx, buf, n) < 0)
+		size_t		n;
+
+		fp = AllocateFile(path, "rb");
+		if (fp == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not open COPY output \"%s\": %m", path)));
+
+		buf = palloc(COPY_FILE_CHUNK_SIZE);
+		while ((n = fread(buf, 1, COPY_FILE_CHUNK_SIZE, fp)) > 0)
 		{
-			pfree(buf);
-			FreeFile(fp);
+			CHECK_FOR_INTERRUPTS();
+			if (pg_cryptohash_update(ctx, (const uint8 *) buf, n) < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("could not update SHA-256 context")));
+		}
+
+		if (ferror(fp))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read COPY output \"%s\": %m", path)));
+
+		if (pg_cryptohash_final(ctx, digest, 32) < 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not update SHA-256 context")));
-		}
+					 errmsg("could not finalize SHA-256 context")));
 	}
-
-	if (ferror(fp))
+	PG_CATCH();
 	{
-		pfree(buf);
-		FreeFile(fp);
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read COPY output \"%s\": %m", path)));
+		if (fp)
+			FreeFile(fp);
+		pg_cryptohash_free(ctx);
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
 
-	pfree(buf);
 	FreeFile(fp);
-
-	if (pg_cryptohash_final(ctx, digest, 32) < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not finalize SHA-256 context")));
 	pg_cryptohash_free(ctx);
 }
 
@@ -133,12 +193,49 @@ copy_column_list_for_table(const char *schema, const char *relname)
 	return pstrdup(cols);
 }
 
+static bool
+table_has_ordinary_inheritance_children(const char *schema, const char *relname)
+{
+	StringInfoData sql;
+	int			ret;
+	bool		result = false;
+
+	initStringInfo(&sql);
+	appendStringInfo(&sql,
+					 "SELECT EXISTS ("
+					 "  SELECT 1 FROM pg_inherits i "
+					 "  JOIN pg_class c ON c.oid = i.inhrelid "
+					 "  JOIN pg_namespace n ON n.oid = c.relnamespace "
+					 "  JOIN pg_class p ON p.oid = i.inhparent "
+					 "  JOIN pg_namespace pn ON pn.oid = p.relnamespace "
+					 "  WHERE pn.nspname = %s "
+					 "    AND p.relname = %s "
+					 "    AND c.relispartition = false "
+					 "    AND n.nspname NOT LIKE '\\_timescaledb\\_%%'"
+					 ")",
+					 quote_literal_cstr(schema),
+					 quote_literal_cstr(relname));
+
+	ret = SPI_execute(sql.data, true, 1);
+	pfree(sql.data);
+
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		char	   *v = SPI_getvalue(SPI_tuptable->vals[0],
+									 SPI_tuptable->tupdesc, 1);
+		if (v != NULL && v[0] == 't')
+			result = true;
+	}
+	return result;
+}
+
 static void
 copy_table_to_tempfile(const char *schema, const char *relname,
 					   CopyTempFile *out)
 {
 	char	   *tmp_path = make_copy_tempfile_path();
 	char	   *cols = copy_column_list_for_table(schema, relname);
+	bool		use_only = table_has_ordinary_inheritance_children(schema, relname);
 	StringInfoData copy_sql;
 	int			ret;
 	struct stat st;
@@ -148,11 +245,14 @@ copy_table_to_tempfile(const char *schema, const char *relname,
 	 * Use COPY (SELECT * FROM ...) rather than COPY <table> ... so that
 	 * TimescaleDB hypertables (where the parent relation's own heap is
 	 * empty and rows live in chunks) export their full contents via the
-	 * planner, not just the parent's heap.
+	 * planner, not just the parent's heap. For ordinary table inheritance
+	 * the children are backed up under their own COPY, so the parent must
+	 * use FROM ONLY to avoid double-counting child rows on restore.
 	 */
 	appendStringInfo(&copy_sql,
-					 "COPY (SELECT %s FROM %s.%s) TO %s (FORMAT binary)",
+					 "COPY (SELECT %s FROM %s%s.%s) TO %s (FORMAT binary)",
 					 cols,
+					 use_only ? "ONLY " : "",
 					 quote_identifier(schema),
 					 quote_identifier(relname),
 					 quote_literal_cstr(tmp_path));
@@ -245,12 +345,7 @@ collect_user_tables(uint32 *count_out)
 		"FROM pg_class c "
 		"JOIN pg_namespace n ON c.relnamespace = n.oid "
 		"WHERE c.relkind = 'r' "
-		"AND n.nspname NOT LIKE 'pg\\_%' "
-		"AND n.nspname NOT IN ('information_schema', 'dbbackup', "
-		"'_timescaledb_internal', '_timescaledb_catalog', "
-		"'_timescaledb_config', '_timescaledb_cache', "
-		"'_timescaledb_functions', 'timescaledb_information', "
-		"'timescaledb_experimental') "
+		"AND " PGDBBACKUP_SKIP_SYSTEM_NSP " "
 		"AND c.oid NOT IN "
 		"(SELECT d.objid FROM pg_depend d WHERE d.deptype = 'e') "
 		"ORDER BY c.oid",

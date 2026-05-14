@@ -137,6 +137,25 @@ first_socket_dir(void)
 }
 
 PGconn *
+pgbu_connect_libpq_conninfo(const char *conninfo)
+{
+	PGconn	   *conn;
+
+	conn = PQconnectdb(conninfo);
+	if (PQstatus(conn) != CONNECTION_OK)
+	{
+		char	   *msg = pstrdup(PQerrorMessage(conn));
+
+		PQfinish(conn);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not connect to primary via libpq for pg_dbbackup auto-route"),
+				 errdetail("%s", msg)));
+	}
+	return conn;
+}
+
+PGconn *
 pgbu_connect_libpq(const char *dbname)
 {
 	char	   *socket_dir;
@@ -170,15 +189,12 @@ pgbu_connect_libpq(const char *dbname)
 	return conn;
 }
 
-PGresult *
-pgbu_libpq_exec_interruptible(PGconn *conn, const char *sql)
+static PGresult *
+drain_libpq_result(PGconn *conn)
 {
 	int			sock;
 	PGresult   *result = NULL;
 	PGresult   *last = NULL;
-
-	if (!PQsendQuery(conn, sql))
-		return NULL;
 
 	sock = PQsocket(conn);
 	if (sock < 0)
@@ -211,6 +227,25 @@ pgbu_libpq_exec_interruptible(PGconn *conn, const char *sql)
 		last = result;
 	}
 	return last;
+}
+
+PGresult *
+pgbu_libpq_exec_interruptible(PGconn *conn, const char *sql)
+{
+	if (!PQsendQuery(conn, sql))
+		return NULL;
+	return drain_libpq_result(conn);
+}
+
+PGresult *
+pgbu_libpq_exec_params_interruptible(PGconn *conn, const char *sql,
+									 int nparams, const Oid *param_types,
+									 const char *const *param_values)
+{
+	if (!PQsendQueryParams(conn, sql, nparams, param_types, param_values,
+						   NULL, NULL, 0))
+		return NULL;
+	return drain_libpq_result(conn);
 }
 
 void
@@ -451,4 +486,46 @@ pgbu_drop_temp_db_quiet(const char *temp_dbname)
 
 	pfree(sql);
 	PQfinish(admin);
+}
+
+char *
+pgbu_libpq_copy_column_list(PGconn *conn, const char *schema,
+							 const char *relname, const char *path)
+{
+	const char *params[2];
+	PGresult   *res;
+	ExecStatusType st;
+	char	   *cols;
+
+	params[0] = schema;
+	params[1] = relname;
+	res = PQexecParams(conn,
+					   "SELECT string_agg(quote_ident(a.attname), ', ' "
+					   "                  ORDER BY a.attnum) "
+					   "FROM pg_class c "
+					   "JOIN pg_namespace n ON c.relnamespace = n.oid "
+					   "JOIN pg_attribute a ON a.attrelid = c.oid "
+					   "WHERE n.nspname = $1 "
+					   "  AND c.relname = $2 "
+					   "  AND a.attnum > 0 "
+					   "  AND NOT a.attisdropped "
+					   "  AND a.attgenerated = ''",
+					   2, NULL, params, NULL, NULL, 0);
+	st = PQresultStatus(res);
+	if (st != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
+		PQgetisnull(res, 0, 0))
+	{
+		char	   *msg = pstrdup(PQerrorMessage(conn));
+
+		PQclear(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("could not enumerate restore columns for \"%s\"",
+						path),
+				 errdetail("%s", msg)));
+	}
+
+	cols = pstrdup(PQgetvalue(res, 0, 0));
+	PQclear(res);
+	return cols;
 }

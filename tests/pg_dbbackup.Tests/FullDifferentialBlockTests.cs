@@ -73,7 +73,7 @@ public sealed class FullDifferentialLogicalTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], target_db := @tgt)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], target_db := @tgt)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p1", fullPath);
                 cmd.Parameters.AddWithValue("p2", diffPath);
@@ -127,7 +127,7 @@ public sealed class FullDifferentialLogicalTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], target_db := @tgt)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], target_db := @tgt)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p1", fullPath);
                 cmd.Parameters.AddWithValue("p2", diffPath);

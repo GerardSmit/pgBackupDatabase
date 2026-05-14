@@ -34,7 +34,7 @@ public sealed class FullRestoreChainTests
             await using var admin = await _pg.AdminAsync();
             await using var cmd = admin.CreateCommand();
             cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], target_db := @tgt)";
+                "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], target_db := @tgt)";
             cmd.Parameters.AddWithValue("db", "ignored");
             cmd.Parameters.AddWithValue("p1", fullPath);
             cmd.Parameters.AddWithValue("p2", diffPath);
@@ -113,7 +113,7 @@ public sealed class FullRestoreChainTests
             await using var admin = await _pg.AdminAsync();
             await using var cmd = admin.CreateCommand();
             cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], target_db := @tgt)";
+                "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], target_db := @tgt)";
             cmd.Parameters.AddWithValue("db", "ignored");
             cmd.Parameters.AddWithValue("p1", fullA);
             cmd.Parameters.AddWithValue("p2", diff2);

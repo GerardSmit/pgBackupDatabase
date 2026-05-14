@@ -23,7 +23,17 @@ public sealed class PgContainerFixture : IAsyncLifetime
 
     private PostgreSqlContainer _container = null!;
 
-    public string ConnectionString => _container.GetConnectionString();
+    public string ConnectionString
+    {
+        get
+        {
+            var b = new NpgsqlConnectionStringBuilder(_container.GetConnectionString())
+            {
+                IncludeErrorDetail = true,
+            };
+            return b.ConnectionString;
+        }
+    }
 
     public static string ProjectRoot { get; } = LocateProjectRoot();
 

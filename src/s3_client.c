@@ -14,6 +14,8 @@
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 
+#include "dbbackup_defaults.h"
+#include "pg_dbbackup.h"
 #include "s3_client.h"
 
 #define S3_EMPTY_SHA256 \
@@ -270,8 +272,8 @@ sha256_file_hex(const char *path, char hex_out[65], uint64 *size_out)
 				 errmsg("could not open \"%s\" for hashing: %m", path)));
 
 	SHA256_Init(&ctx);
-	buf = palloc(1024 * 1024);
-	while ((n = fread(buf, 1, 1024 * 1024, fp)) > 0)
+	buf = palloc(PGDBBACKUP_COPY_CHUNK_SIZE);
+	while ((n = fread(buf, 1, PGDBBACKUP_COPY_CHUNK_SIZE, fp)) > 0)
 	{
 		CHECK_FOR_INTERRUPTS();
 		SHA256_Update(&ctx, buf, n);
@@ -643,7 +645,8 @@ static void
 perform_request(PgdbS3Config *config, S3Request *req)
 {
 	int			attempt;
-	int			max_retries = config->max_retries > 0 ? config->max_retries : 3;
+	int			max_retries = config->max_retries > 0
+		? config->max_retries : pgdb_s3_default_max_retries;
 	CURLcode	last_rc = CURLE_OK;
 	long		last_status = 0;
 	char		last_err[CURL_ERROR_SIZE] = "";
@@ -653,7 +656,7 @@ perform_request(PgdbS3Config *config, S3Request *req)
 	for (attempt = 0; attempt <= max_retries; attempt++)
 	{
 		S3UrlParts	parts;
-		CURL	   *curl;
+		CURL	   *curl = NULL;
 		struct curl_slist *headers = NULL;
 		StringInfoData signed_headers;
 		StringInfoData canonical_extra;
@@ -693,116 +696,147 @@ perform_request(PgdbS3Config *config, S3Request *req)
 		sha_header = psprintf("x-amz-content-sha256: %s", req->payload_hash);
 		date_header = psprintf("x-amz-date: %s", amz_date);
 		auth_header = psprintf("Authorization: %s", auth);
-		headers = curl_slist_append(headers, host_header);
-		headers = curl_slist_append(headers, sha_header);
-		headers = curl_slist_append(headers, date_header);
-		headers = curl_slist_append(headers, auth_header);
 
-		if (curl_extra_headers.len > 0)
+		/*
+		 * Everything between PG_TRY and PG_END_TRY may longjmp out via
+		 * ereport(ERROR). libcurl handles, curl_slist, and FILE* are not
+		 * tracked by Postgres's memory contexts, so the catch path must
+		 * release them explicitly before re-throwing.
+		 */
+		PG_TRY();
 		{
-			char	   *saveptr = NULL;
-			char	   *line;
-			char	   *copy = pstrdup(curl_extra_headers.data);
+			headers = curl_slist_append(headers, host_header);
+			headers = curl_slist_append(headers, sha_header);
+			headers = curl_slist_append(headers, date_header);
+			headers = curl_slist_append(headers, auth_header);
 
-			for (line = strtok_r(copy, "\n", &saveptr);
-				 line != NULL;
-				 line = strtok_r(NULL, "\n", &saveptr))
-				headers = curl_slist_append(headers, line);
-			pfree(copy);
-		}
-
-		curl = curl_easy_init();
-		if (curl == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not allocate libcurl easy handle")));
-
-		curl_easy_setopt(curl, CURLOPT_URL, parts.base_url);
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, req->method);
-		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, last_err);
-		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
-		curl_easy_setopt(curl, CURLOPT_HEADERDATA, req);
-		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
-						 config->connect_timeout_ms > 0
-						 ? config->connect_timeout_ms : 10000);
-		curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
-						 config->request_timeout_ms > 0
-						 ? config->request_timeout_ms : 300000);
-		if (config->bandwidth_limit_bps > 0)
-			curl_easy_setopt(curl, CURLOPT_MAX_SEND_SPEED_LARGE,
-							 (curl_off_t) config->bandwidth_limit_bps);
-
-		if (req->head_only)
-			curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
-		else if (req->upload_file)
-		{
-			upload_fp = AllocateFile(req->upload_file, "rb");
-			if (upload_fp == NULL)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not open \"%s\" for S3 upload: %m",
-								req->upload_file)));
-			if (req->upload_offset > 0 &&
-				fseeko(upload_fp, (off_t) req->upload_offset, SEEK_SET) != 0)
+			if (curl_extra_headers.len > 0)
 			{
-				FreeFile(upload_fp);
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not seek \"%s\" for S3 upload: %m",
-								req->upload_file)));
+				char	   *saveptr = NULL;
+				char	   *line;
+				char	   *copy = pstrdup(curl_extra_headers.data);
+
+				for (line = strtok_r(copy, "\n", &saveptr);
+					 line != NULL;
+					 line = strtok_r(NULL, "\n", &saveptr))
+					headers = curl_slist_append(headers, line);
+				pfree(copy);
 			}
-			read_state.fp = upload_fp;
-			read_state.path = req->upload_file;
-			read_state.remaining = req->upload_size;
-			curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
-			curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_file_cb);
-			curl_easy_setopt(curl, CURLOPT_READDATA, &read_state);
-			curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
-							 (curl_off_t) req->upload_size);
-		}
-		else if (req->upload_text)
-		{
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req->upload_text);
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
-							 (curl_off_t) strlen(req->upload_text));
-		}
-		else if (strcmp(req->method, "PUT") == 0)
-		{
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
-		}
-		else if (strcmp(req->method, "POST") == 0)
-		{
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
-			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
-		}
 
-		if (req->download_file)
-		{
-			download_fp = AllocateFile(req->download_file, "wb");
-			if (download_fp == NULL)
+			curl = curl_easy_init();
+			if (curl == NULL)
 				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not open \"%s\" for S3 download: %m",
-								req->download_file)));
-			write_state.fp = download_fp;
-			write_state.path = req->download_file;
-			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file_cb);
-			curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_state);
-		}
-		else if (req->response_body)
-		{
-			curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_string_cb);
-			curl_easy_setopt(curl, CURLOPT_WRITEDATA, req->response_body);
-		}
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("could not allocate libcurl easy handle")));
 
-		last_err[0] = '\0';
-		last_rc = curl_easy_perform(curl);
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &last_status);
-		curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
-						  &req->download_size);
+			curl_easy_setopt(curl, CURLOPT_URL, parts.base_url);
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+			curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, req->method);
+			curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, last_err);
+			curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+			curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_cb);
+			curl_easy_setopt(curl, CURLOPT_HEADERDATA, req);
+			curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS,
+							 config->connect_timeout_ms > 0
+							 ? config->connect_timeout_ms
+							 : pgdb_s3_default_connect_timeout_ms);
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS,
+							 config->request_timeout_ms > 0
+							 ? config->request_timeout_ms
+							 : pgdb_s3_default_request_timeout_ms);
+			if (config->bandwidth_limit_bps > 0)
+				curl_easy_setopt(curl, CURLOPT_MAX_SEND_SPEED_LARGE,
+								 (curl_off_t) config->bandwidth_limit_bps);
+
+			if (req->head_only)
+				curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+			else if (req->upload_file)
+			{
+				upload_fp = AllocateFile(req->upload_file, "rb");
+				if (upload_fp == NULL)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not open \"%s\" for S3 upload: %m",
+									req->upload_file)));
+				if (req->upload_offset > 0 &&
+					fseeko(upload_fp, (off_t) req->upload_offset, SEEK_SET) != 0)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not seek \"%s\" for S3 upload: %m",
+									req->upload_file)));
+				read_state.fp = upload_fp;
+				read_state.path = req->upload_file;
+				read_state.remaining = req->upload_size;
+				curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+				curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_file_cb);
+				curl_easy_setopt(curl, CURLOPT_READDATA, &read_state);
+				curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
+								 (curl_off_t) req->upload_size);
+			}
+			else if (req->upload_text)
+			{
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req->upload_text);
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
+								 (curl_off_t) strlen(req->upload_text));
+			}
+			else if (strcmp(req->method, "PUT") == 0)
+			{
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
+			}
+			else if (strcmp(req->method, "POST") == 0)
+			{
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDS, "");
+				curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) 0);
+			}
+
+			if (req->download_file)
+			{
+				download_fp = AllocateFile(req->download_file, "wb");
+				if (download_fp == NULL)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not open \"%s\" for S3 download: %m",
+									req->download_file)));
+				write_state.fp = download_fp;
+				write_state.path = req->download_file;
+				curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file_cb);
+				curl_easy_setopt(curl, CURLOPT_WRITEDATA, &write_state);
+			}
+			else if (req->response_body)
+			{
+				curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_string_cb);
+				curl_easy_setopt(curl, CURLOPT_WRITEDATA, req->response_body);
+			}
+
+			last_err[0] = '\0';
+			last_rc = curl_easy_perform(curl);
+			curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &last_status);
+			curl_easy_getinfo(curl, CURLINFO_CONTENT_LENGTH_DOWNLOAD_T,
+							  &req->download_size);
+		}
+		PG_CATCH();
+		{
+			if (upload_fp)
+				FreeFile(upload_fp);
+			if (download_fp)
+			{
+				FreeFile(download_fp);
+				/*
+				 * Leaving a half-written file at req->download_file would
+				 * silently corrupt a subsequent restore that treats the
+				 * path as a complete artifact.
+				 */
+				if (req->download_file)
+					(void) unlink(req->download_file);
+			}
+			if (headers)
+				curl_slist_free_all(headers);
+			if (curl)
+				curl_easy_cleanup(curl);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 
 		if (upload_fp)
 			FreeFile(upload_fp);
@@ -814,6 +848,13 @@ perform_request(PgdbS3Config *config, S3Request *req)
 
 		if (last_rc == CURLE_OK && last_status >= 200 && last_status < 300)
 			return;
+
+		/*
+		 * A non-2xx response or transport error means the download file
+		 * (if any) is incomplete or contains an error document body.
+		 */
+		if (req->download_file)
+			(void) unlink(req->download_file);
 
 		if (attempt < max_retries &&
 			(curl_retryable(last_rc) || status_retryable(last_status)))

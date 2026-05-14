@@ -31,7 +31,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], target_db := @tgt)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], target_db := @tgt)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
@@ -75,7 +75,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], target_db := @db)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], target_db := @db)";
                 cmd.Parameters.AddWithValue("db", dbName);
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.CommandTimeout = 120;
@@ -120,7 +120,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], target_db := @tgt)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], target_db := @tgt)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p", path);
                 cmd.Parameters.AddWithValue("tgt", target);
@@ -166,7 +166,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], target_db := @tgt)";
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], target_db := @tgt)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p1", fullPath);
                 cmd.Parameters.AddWithValue("p2", logPath);
@@ -209,7 +209,7 @@ public sealed class FullRestoreTests
             await using var admin = await _pg.AdminAsync();
             await using var cmd = admin.CreateCommand();
             cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], " +
+                "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], " +
                 "target_db := @tgt, stop_at := now() + interval '1 hour')";
             cmd.Parameters.AddWithValue("db", "ignored");
             cmd.Parameters.AddWithValue("p", path);
@@ -240,7 +240,7 @@ public sealed class FullRestoreTests
             await using var admin = await _pg.AdminAsync();
             await using var cmd = admin.CreateCommand();
             cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], " +
+                "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], " +
                 "target_db := @tgt, stop_at := now())";
             cmd.Parameters.AddWithValue("db", "ignored");
             cmd.Parameters.AddWithValue("p", simplePath);
@@ -290,7 +290,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], " +
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], " +
                     "target_db := @tgt, stop_at := @cutoff)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p", path);
@@ -352,7 +352,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], " +
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], " +
                     "target_db := @tgt, stop_at := @cutoff)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p1", fullPath);
@@ -413,7 +413,7 @@ public sealed class FullRestoreTests
             await using (var cmd = admin.CreateCommand())
             {
                 cmd.CommandText =
-                    "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p1, @p2]::text[], " +
+                    "SELECT dbbackup.pg_dbrestore(ARRAY[@p1, @p2]::text[], " +
                     "target_db := @tgt, stop_at := @cutoff)";
                 cmd.Parameters.AddWithValue("db", "ignored");
                 cmd.Parameters.AddWithValue("p1", fullPath);
@@ -464,7 +464,7 @@ public sealed class FullRestoreTests
         await using (var cmd = admin.CreateCommand())
         {
             cmd.CommandText =
-                "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], target_db := @tgt)";
+                "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], target_db := @tgt)";
             cmd.Parameters.AddWithValue("db", "ignored");
             cmd.Parameters.AddWithValue("p", path);
             cmd.Parameters.AddWithValue("tgt", target);

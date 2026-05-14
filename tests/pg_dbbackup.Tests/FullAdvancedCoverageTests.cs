@@ -530,7 +530,7 @@ public sealed class FullAdvancedCoverageTests
         await using var admin = await _pg.AdminAsync();
         await using var cmd = admin.CreateCommand();
         cmd.CommandText =
-            "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@full, @log]::text[], " +
+            "SELECT dbbackup.pg_dbrestore(ARRAY[@full, @log]::text[], " +
             "target_db := @target, stop_at := @stop)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("full", full);
@@ -553,7 +553,7 @@ public sealed class FullAdvancedCoverageTests
 
         await using var cmd = admin.CreateCommand();
         cmd.CommandText =
-            "SELECT dbbackup.pg_dbrestore(@db, @files::text[], target_db := @target)";
+            "SELECT dbbackup.pg_dbrestore(@files::text[], target_db := @target)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("files", files);
         cmd.Parameters.AddWithValue("target", target);

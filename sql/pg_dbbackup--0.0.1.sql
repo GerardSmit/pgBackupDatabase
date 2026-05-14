@@ -210,6 +210,13 @@ BEGIN
         RETURN;
     END IF;
 
+    -- Skip maintenance-only commands that don't change schema/data.
+    -- REINDEX/VACUUM/CLUSTER cannot run inside the replay transaction
+    -- block and have no effect on logical state.
+    IF tg_tag IN ('REINDEX', 'VACUUM', 'CLUSTER', 'ANALYZE') THEN
+        RETURN;
+    END IF;
+
     INSERT INTO dbbackup.ddl_log(tag, command)
     VALUES (tg_tag, q);
 END
@@ -231,6 +238,35 @@ BEGIN
     END IF;
 
     IF q ~* '^\s*DROP\s+EXTENSION\s+pg_dbbackup\b' THEN
+        RETURN;
+    END IF;
+
+    -- ddl_command_end already captured this command for ALTER/CREATE etc.
+    -- Only record drops that fired sql_drop without ddl_command_end firing
+    -- (the all-drops case has no ddl_command_end on the failing object).
+    IF tg_tag NOT IN ('DROP TABLE', 'DROP INDEX', 'DROP VIEW',
+                      'DROP MATERIALIZED VIEW', 'DROP SEQUENCE',
+                      'DROP TYPE', 'DROP DOMAIN', 'DROP SCHEMA',
+                      'DROP FUNCTION', 'DROP PROCEDURE', 'DROP TRIGGER',
+                      'DROP RULE', 'DROP POLICY', 'DROP OPERATOR',
+                      'DROP OPERATOR CLASS', 'DROP OPERATOR FAMILY',
+                      'DROP CAST', 'DROP COLLATION', 'DROP STATISTICS',
+                      'DROP EXTENSION', 'DROP FOREIGN TABLE',
+                      'DROP SERVER', 'DROP USER MAPPING',
+                      'DROP FOREIGN DATA WRAPPER', 'DROP PUBLICATION',
+                      'DROP SUBSCRIPTION', 'DROP TEXT SEARCH CONFIGURATION',
+                      'DROP TEXT SEARCH DICTIONARY',
+                      'DROP TEXT SEARCH PARSER',
+                      'DROP TEXT SEARCH TEMPLATE',
+                      'DROP AGGREGATE', 'DROP EVENT TRIGGER',
+                      'DROP LANGUAGE') THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM dbbackup.ddl_log
+        WHERE txid = txid_current() AND command = q
+    ) THEN
         RETURN;
     END IF;
 
@@ -274,9 +310,9 @@ CREATE FUNCTION dbbackup.pg_dbbackup(
 AS 'MODULE_PATHNAME', 'pg_dbbackup'
 LANGUAGE C VOLATILE;
 
--- Restore a database from .bak files
+-- Restore a database from .bak files. target_db defaults to the db_name
+-- recorded in the first .bak header.
 CREATE FUNCTION dbbackup.pg_dbrestore(
-    dbname    text,
     files     text[],
     target_db text DEFAULT NULL,
     stop_at   timestamptz DEFAULT NULL,
@@ -684,16 +720,18 @@ AS $$
 DECLARE
     target text;
 BEGIN
-    SELECT storage_target INTO target
-      FROM dbbackup.backup_sets
-     WHERE name = backup_set;
+    SELECT bs.storage_target INTO target
+      FROM dbbackup.backup_sets bs
+     WHERE bs.name = remove_database_from_backup_set.backup_set;
     IF target IS NULL THEN
         RAISE EXCEPTION 'backup set "%" does not exist', backup_set;
     END IF;
 
     IF close_chain
-       AND EXISTS (SELECT 1 FROM pg_database WHERE datname = dbname)
-       AND dbbackup.pg_dbbackup_get_mode(dbname) = 'full' THEN
+       AND EXISTS (SELECT 1 FROM pg_database d
+                    WHERE d.datname = remove_database_from_backup_set.dbname)
+       AND dbbackup.pg_dbbackup_get_mode(
+              remove_database_from_backup_set.dbname) = 'full' THEN
         BEGIN
             PERFORM dbbackup.pg_dbbackup_to_storage(
                 dbname := remove_database_from_backup_set.dbname,
@@ -710,14 +748,14 @@ BEGIN
     END IF;
 
     IF keep_history THEN
-        UPDATE dbbackup.backup_set_databases
+        UPDATE dbbackup.backup_set_databases b
            SET active = false, removed_at = now()
-         WHERE backup_set = remove_database_from_backup_set.backup_set
-           AND dbname = remove_database_from_backup_set.dbname;
+         WHERE b.backup_set = remove_database_from_backup_set.backup_set
+           AND b.dbname = remove_database_from_backup_set.dbname;
     ELSE
-        DELETE FROM dbbackup.backup_set_databases
-         WHERE backup_set = remove_database_from_backup_set.backup_set
-           AND dbname = remove_database_from_backup_set.dbname;
+        DELETE FROM dbbackup.backup_set_databases b
+         WHERE b.backup_set = remove_database_from_backup_set.backup_set
+           AND b.dbname = remove_database_from_backup_set.dbname;
     END IF;
 END
 $$;
@@ -1202,11 +1240,11 @@ CREATE FUNCTION dbbackup.set_retention_policy(
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    INSERT INTO dbbackup.retention_policies(
+    INSERT INTO dbbackup.retention_policies AS rp (
         backup_set, keep_incrementals_for, keep_fulls_for,
         keep_min_full_chains, delete_remote, updated_at)
     VALUES ($1, $2, $3, $4, $5, now())
-    ON CONFLICT (backup_set) DO UPDATE SET
+    ON CONFLICT ON CONSTRAINT retention_policies_pkey DO UPDATE SET
         keep_incrementals_for = EXCLUDED.keep_incrementals_for,
         keep_fulls_for = EXCLUDED.keep_fulls_for,
         keep_min_full_chains = EXCLUDED.keep_min_full_chains,
@@ -1483,4 +1521,14 @@ CREATE FUNCTION dbbackup.pg_dbbackup_wait(
     timeout_secs int DEFAULT 300
 ) RETURNS text
 AS 'MODULE_PATHNAME', 'pg_dbbackup_wait'
+LANGUAGE C VOLATILE STRICT;
+
+-- Sweep orphan pg_dbbackup_*.bak / .bak.tmp files older than min_age_seconds.
+-- Returns count removed. Bgworker tick also performs this sweep with the
+-- built-in 1-hour threshold; callers may run it manually for testing or
+-- after a known crash event.
+CREATE FUNCTION dbbackup.pg_dbbackup_sweep_orphan_tmp_files(
+    min_age_seconds int DEFAULT 3600
+) RETURNS int
+AS 'MODULE_PATHNAME', 'pg_dbbackup_sweep_orphan_tmp_files'
 LANGUAGE C VOLATILE STRICT;

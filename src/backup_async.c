@@ -46,22 +46,6 @@ typedef struct AsyncWorkerPayload
 StaticAssertDecl(sizeof(AsyncWorkerPayload) <= BGW_EXTRALEN,
 				 "AsyncWorkerPayload exceeds bgw_extra capacity");
 
-static PgDbBackupType
-parse_backup_type_arg(const char *type_str)
-{
-	if (strcmp(type_str, "full") == 0)
-		return BACKUP_TYPE_FULL;
-	if (strcmp(type_str, "differential") == 0)
-		return BACKUP_TYPE_DIFFERENTIAL;
-	if (strcmp(type_str, "log") == 0)
-		return BACKUP_TYPE_LOG;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("type must be 'full', 'differential', or 'log'")));
-	return BACKUP_TYPE_FULL;
-}
-
 static pg_uuid_t
 generate_backup_uuid(void)
 {
@@ -214,7 +198,10 @@ pg_dbbackup_async(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to perform backups")));
 
-	(void) parse_backup_type_arg(type_str);
+	(void) pgdb_parse_backup_type(type_str);
+	pgdb_validate_filesystem_path(filepath, "filepath");
+	if (base_filepath != NULL)
+		pgdb_validate_filesystem_path(base_filepath, "base_filepath");
 
 	db_oid = get_database_oid(dbname, false);
 
@@ -282,7 +269,7 @@ pg_dbbackup_to_storage_async(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to perform backups")));
 
-	(void) parse_backup_type_arg(type_str);
+	(void) pgdb_parse_backup_type(type_str);
 
 	db_oid = get_database_oid(dbname, false);
 	backup_id = generate_backup_uuid();
@@ -415,7 +402,7 @@ worker_dispatch_backup(const AsyncWorkerPayload *payload,
 					   bool compress, const char *password,
 					   const char *base_filepath)
 {
-	PgDbBackupType backup_type = parse_backup_type_arg(type_str);
+	PgDbBackupType backup_type = pgdb_parse_backup_type(type_str);
 	PgDbBackupMode mode = pg_dbbackup_resolve_mode(payload->db_oid);
 
 	if (mode == BACKUP_MODE_SIMPLE && backup_type == BACKUP_TYPE_LOG)

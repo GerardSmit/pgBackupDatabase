@@ -15,49 +15,7 @@
 #include "libpq_helpers.h"
 #include "restore_full.h"
 
-#define RESTORE_COPY_CHUNK_SIZE (1024 * 1024)
-
-static char *
-libpq_copy_column_list(PGconn *conn, const char *schema,
-					   const char *relname, const char *path)
-{
-	const char *params[2];
-	PGresult   *res;
-	ExecStatusType st;
-	char	   *cols;
-
-	params[0] = schema;
-	params[1] = relname;
-	res = PQexecParams(conn,
-					   "SELECT string_agg(quote_ident(a.attname), ', ' "
-					   "                  ORDER BY a.attnum) "
-					   "FROM pg_class c "
-					   "JOIN pg_namespace n ON c.relnamespace = n.oid "
-					   "JOIN pg_attribute a ON a.attrelid = c.oid "
-					   "WHERE n.nspname = $1 "
-					   "  AND c.relname = $2 "
-					   "  AND a.attnum > 0 "
-					   "  AND NOT a.attisdropped "
-					   "  AND a.attgenerated = ''",
-					   2, NULL, params, NULL, NULL, 0);
-	st = PQresultStatus(res);
-	if (st != PGRES_TUPLES_OK || PQntuples(res) != 1 ||
-		PQgetisnull(res, 0, 0))
-	{
-		char	   *msg = pstrdup(PQerrorMessage(conn));
-
-		PQclear(res);
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not enumerate restore columns for \"%s\"",
-						path),
-				 errdetail("%s", msg)));
-	}
-
-	cols = pstrdup(PQgetvalue(res, 0, 0));
-	PQclear(res);
-	return cols;
-}
+#include "dbbackup_defaults.h"
 
 static void
 logical_libpq_copy_in_from_reader(PGconn *conn, BakFileReader *reader,
@@ -84,7 +42,7 @@ logical_libpq_copy_in_from_reader(PGconn *conn, BakFileReader *reader,
 						entry->path)));
 	schema = pnstrdup(entry->path, dot - entry->path);
 	relname = pstrdup(dot + 1);
-	cols = libpq_copy_column_list(conn, schema, relname, entry->path);
+	cols = pgbu_libpq_copy_column_list(conn, schema, relname, entry->path);
 
 	initStringInfo(&copy_sql);
 	appendStringInfo(&copy_sql,
@@ -114,12 +72,12 @@ logical_libpq_copy_in_from_reader(PGconn *conn, BakFileReader *reader,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not initialize SHA-256 context")));
 
-	buf = palloc(RESTORE_COPY_CHUNK_SIZE);
+	buf = palloc(PGDBBACKUP_COPY_CHUNK_SIZE);
 	remaining = entry->data_len;
 	while (remaining > 0)
 	{
-		size_t		chunk = (remaining > RESTORE_COPY_CHUNK_SIZE) ?
-			RESTORE_COPY_CHUNK_SIZE : (size_t) remaining;
+		size_t		chunk = (remaining > PGDBBACKUP_COPY_CHUNK_SIZE) ?
+			PGDBBACKUP_COPY_CHUNK_SIZE : (size_t) remaining;
 
 		CHECK_FOR_INTERRUPTS();
 		bakfile_read_data_entry_chunk(reader, buf, chunk);

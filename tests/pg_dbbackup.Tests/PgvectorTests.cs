@@ -16,7 +16,7 @@ public sealed class PgvectorTests
         await using var admin = await _pg.AdminAsync();
         await using var cmd = admin.CreateCommand();
         cmd.CommandText =
-            "SELECT dbbackup.pg_dbrestore(@db, ARRAY[@p]::text[], target_db := @tgt)";
+            "SELECT dbbackup.pg_dbrestore(ARRAY[@p]::text[], target_db := @tgt)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("p", path);
         cmd.Parameters.AddWithValue("tgt", target);

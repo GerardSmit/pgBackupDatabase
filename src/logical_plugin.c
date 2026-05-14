@@ -157,7 +157,8 @@ pgdb_decode_message(LogicalDecodingContext *ctx, ReorderBufferTXN *txn,
 }
 
 static void
-append_quoted_literal(StringInfo s, Oid typid, Datum value, bool isnull)
+append_quoted_literal(StringInfo s, Oid typid, int32 typmod,
+					  Datum value, bool isnull)
 {
 	Oid			typoutput;
 	bool		typisvarlena;
@@ -185,7 +186,7 @@ append_quoted_literal(StringInfo s, Oid typid, Datum value, bool isnull)
 		appendStringInfoChar(s, *p);
 	}
 	appendStringInfoChar(s, '\'');
-	appendStringInfo(s, "::%s", format_type_be(typid));
+	appendStringInfo(s, "::%s", format_type_with_typemod(typid, typmod));
 }
 
 static bool
@@ -235,7 +236,7 @@ append_tuple_values(StringInfo s, TupleDesc tupdesc, HeapTuple tuple)
 
 		if (!first)
 			appendStringInfoString(s, ", ");
-		append_quoted_literal(s, attr->atttypid, value, isnull);
+		append_quoted_literal(s, attr->atttypid, attr->atttypmod, value, isnull);
 		first = false;
 	}
 }
@@ -261,7 +262,7 @@ append_tuple_assignments(StringInfo s, TupleDesc tupdesc, HeapTuple tuple)
 			appendStringInfoString(s, ", ");
 		appendStringInfoString(s, quote_identifier(NameStr(attr->attname)));
 		appendStringInfoString(s, " = ");
-		append_quoted_literal(s, attr->atttypid, value, isnull);
+		append_quoted_literal(s, attr->atttypid, attr->atttypmod, value, isnull);
 		first = false;
 	}
 }
@@ -292,7 +293,7 @@ append_tuple_predicate(StringInfo s, TupleDesc tupdesc, HeapTuple tuple,
 			appendStringInfoString(s, " AND ");
 		appendStringInfoString(s, quote_identifier(NameStr(attr->attname)));
 		appendStringInfoString(s, " IS NOT DISTINCT FROM ");
-		append_quoted_literal(s, attr->atttypid, value, isnull);
+		append_quoted_literal(s, attr->atttypid, attr->atttypmod, value, isnull);
 		first = false;
 	}
 

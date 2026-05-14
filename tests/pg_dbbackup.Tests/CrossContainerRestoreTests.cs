@@ -124,7 +124,7 @@ public sealed class CrossContainerRestoreTests
         await using var admin = await targetPg.AdminAsync();
         await using var cmd = admin.CreateCommand();
         cmd.CommandText =
-            "SELECT dbbackup.pg_dbrestore(@db, @files::text[], target_db := @target)";
+            "SELECT dbbackup.pg_dbrestore(@files::text[], target_db := @target)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("files", files);
         cmd.Parameters.AddWithValue("target", targetDb);

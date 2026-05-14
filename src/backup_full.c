@@ -22,13 +22,18 @@
 #include "logical_journal.h"
 #include "metadata_gen.h"
 
-#define SKIP_SYSTEM_NSP_SQL \
-	"n.nspname NOT LIKE 'pg\\_%%' " \
-	"AND n.nspname NOT IN ('information_schema', 'dbbackup', " \
-	"'_timescaledb_internal', '_timescaledb_catalog', " \
-	"'_timescaledb_config', '_timescaledb_cache', " \
-	"'_timescaledb_functions', 'timescaledb_information', " \
-	"'timescaledb_experimental')"
+/*
+ * Inside appendStringInfo we need the printf-format-escaped variant; the
+ * plain variant is used for direct SPI_execute strings further down.
+ */
+#define SKIP_SYSTEM_NSP_SQL PGDBBACKUP_SKIP_SYSTEM_NSP_FMT
+
+static XLogRecPtr advance_logical_slot_to_lsn(const char *slot_name,
+											   XLogRecPtr upto_lsn);
+static void upsert_logical_chain(Oid db_oid, const char *db_name,
+								  const char *slot_name,
+								  XLogRecPtr confirmed_lsn);
+static XLogRecPtr slot_confirmed_flush_lsn(const char *slot_name);
 
 static void
 capture_db_xid_bounds(Oid db_oid, uint32 *frozen_xid_out, uint32 *min_mxid_out)
@@ -104,110 +109,39 @@ validate_full_feature_matrix(Oid db_oid)
 	has_cagg_catalog = timescale_continuous_agg_catalog_exists();
 
 	initStringInfo(&sql);
-	appendStringInfo(&sql,
+	(void) has_cagg_catalog;
+	(void) db_oid;
+	appendStringInfoString(&sql,
 					 "WITH unsupported AS ("
 					 "  SELECT n.nspname AS schema_name, c.relname AS object_name, "
-					 "         CASE "
-					 "           WHEN c.relkind IN ('r', 'p') AND c.relpersistence = 'u' "
-					 "             THEN 'unlogged tables' "
-					 "           WHEN c.relkind = 'f' "
-					 "             THEN 'foreign tables' "
-					 "           WHEN c.relkind = 'm' %s "
-					 "             THEN 'materialized views' "
-					 "           WHEN c.relkind = 'r' AND c.relispartition = false "
-					 "                AND EXISTS ("
-					 "                  SELECT 1 FROM pg_inherits i "
-					 "                  WHERE i.inhrelid = c.oid"
-					 "                ) "
-					 "             THEN 'ordinary table inheritance' "
-					 "           WHEN c.relkind = 'r' "
-					 "                AND EXISTS ("
-					 "                  SELECT 1 FROM pg_inherits i "
-					 "                  JOIN pg_class child ON child.oid = i.inhrelid "
-					 "                  JOIN pg_namespace childn ON childn.oid = child.relnamespace "
-					 "                  WHERE i.inhparent = c.oid "
-					 "                    AND child.relispartition = false"
-					 "                    AND childn.nspname NOT LIKE 'pg\\_%%' "
-					 "                    AND childn.nspname NOT IN ('information_schema', 'dbbackup', "
-					 "                      '_timescaledb_internal', '_timescaledb_catalog', "
-					 "                      '_timescaledb_config', '_timescaledb_cache', "
-					 "                      '_timescaledb_functions', 'timescaledb_information', "
-					 "                      'timescaledb_experimental') "
-					 "                ) "
-					 "             THEN 'ordinary table inheritance' "
-					 "         END AS reason "
+					 "         'unlogged tables' AS reason "
 					 "  FROM pg_class c "
 					 "  JOIN pg_namespace n ON c.relnamespace = n.oid "
 					 "  WHERE " SKIP_SYSTEM_NSP_SQL " "
-					 "    AND c.relkind IN ('r', 'p', 'f', 'm') "
+					 "    AND c.relkind IN ('r', 'p') "
+					 "    AND c.relpersistence = 'u' "
 					 "    AND NOT EXISTS ("
 					 "      SELECT 1 FROM pg_depend d "
 					 "      WHERE d.objid = c.oid AND d.deptype = 'e'"
 					 "    ) "
 					 "UNION ALL "
-					 "  SELECT n.nspname, t.typname, 'user-defined range/base/pseudo types' "
+					 "  SELECT n.nspname, t.typname, 'user-defined base/pseudo types' "
 					 "  FROM pg_type t "
 					 "  JOIN pg_namespace n ON t.typnamespace = n.oid "
 					 "  WHERE " SKIP_SYSTEM_NSP_SQL " "
-					 "    AND (t.typtype IN ('r', 'm') "
-					 "         OR (t.typtype IN ('b', 'p') "
-					 "             AND t.typelem = 0 "
-					 "             AND t.typrelid = 0)) "
+					 "    AND t.typtype IN ('b', 'p') "
+					 "    AND t.typelem = 0 "
+					 "    AND t.typrelid = 0 "
 					 "    AND NOT EXISTS ("
 					 "      SELECT 1 FROM pg_depend d "
 					 "      WHERE d.objid = t.oid AND d.deptype = 'e'"
 					 "    ) "
-					 "UNION ALL "
-					 "  SELECT n.nspname, p.proname, 'user-defined aggregates' "
-					 "  FROM pg_proc p "
-					 "  JOIN pg_namespace n ON p.pronamespace = n.oid "
-					 "  WHERE " SKIP_SYSTEM_NSP_SQL " "
-					 "    AND p.prokind = 'a' "
-					 "    AND NOT EXISTS ("
-					 "      SELECT 1 FROM pg_depend d "
-					 "      WHERE d.objid = p.oid AND d.deptype = 'e'"
-					 "    ) "
-					 "UNION ALL "
-					 "  SELECT n.nspname, cfg.cfgname, 'custom text search configurations' "
-					 "  FROM pg_ts_config cfg "
-					 "  JOIN pg_namespace n ON cfg.cfgnamespace = n.oid "
-					 "  WHERE " SKIP_SYSTEM_NSP_SQL " "
-					 "    AND NOT EXISTS ("
-					 "      SELECT 1 FROM pg_depend d "
-					 "      WHERE d.objid = cfg.oid AND d.deptype = 'e'"
-					 "    ) "
-					 "UNION ALL "
-					 "  SELECT 'pg_catalog', e.evtname, 'user-defined event triggers' "
-					 "  FROM pg_event_trigger e "
-					 "  WHERE e.evtname NOT LIKE 'pg_dbbackup_%%' "
-					 "    AND NOT EXISTS ("
-					 "      SELECT 1 FROM pg_depend d "
-					 "      WHERE d.objid = e.oid AND d.deptype = 'e'"
-					 "    ) "
-					 "UNION ALL "
-					 "  SELECT 'pg_catalog', p.pubname, 'logical replication publications' "
-					 "  FROM pg_publication p "
-					 "  WHERE NOT EXISTS ("
-					 "      SELECT 1 FROM pg_depend d "
-					 "      WHERE d.objid = p.oid AND d.deptype = 'e'"
-					 "    ) "
-					 "UNION ALL "
-					 "  SELECT 'pg_catalog', s.subname, 'logical replication subscriptions' "
-					 "  FROM pg_subscription s "
-					 "  WHERE s.subdbid = %u"
 					 ") "
 					 "SELECT schema_name, object_name, reason "
 					 "FROM unsupported "
 					 "WHERE reason IS NOT NULL "
 					 "ORDER BY schema_name, object_name "
-					 "LIMIT 1",
-					 has_cagg_catalog ?
-					 "AND NOT EXISTS ("
-					 "  SELECT 1 FROM _timescaledb_catalog.continuous_agg ca "
-					 "  WHERE ca.user_view_schema = n.nspname "
-					 "    AND ca.user_view_name = c.relname"
-					 ")" : "",
-					 db_oid);
+					 "LIMIT 1");
 
 	ret = SPI_execute(sql.data, true, 1);
 	pfree(sql.data);
@@ -537,6 +471,26 @@ active_chain_slot_for_previous_backup(Oid db_oid, const char *db_name,
 				 errhint("Use the most recent backup in the chain, or take a new FULL backup.")));
 	}
 
+	/*
+	 * Reconcile the slot's confirmed_flush_lsn with the chain endpoint.
+	 * The chain row is written before pg_replication_slot_advance so a
+	 * crash between them leaves slot.confirmed < chain.endpoint; advance
+	 * the slot forward to close that gap. We must skip the advance if the
+	 * slot is already at or past chain.endpoint, because
+	 * pg_replication_slot_advance errors out (rather than no-op'ing) when
+	 * asked to move backwards. A slot that is *ahead* of chain.endpoint
+	 * only happens with a recreated slot or a pre-fix database; downstream
+	 * checks (failover/invalidation/peek_changes) will then surface the
+	 * real problem.
+	 */
+	{
+		XLogRecPtr	slot_confirmed = slot_confirmed_flush_lsn(slot_name);
+
+		if (!XLogRecPtrIsInvalid(slot_confirmed) &&
+			slot_confirmed < confirmed_lsn)
+			(void) advance_logical_slot_to_lsn(slot_name, confirmed_lsn);
+	}
+
 	return slot_name;
 }
 
@@ -690,6 +644,35 @@ emit_logical_flush_marker(bool switch_wal)
 }
 
 static XLogRecPtr
+slot_confirmed_flush_lsn(const char *slot_name)
+{
+	int			ret;
+	XLogRecPtr	lsn = InvalidXLogRecPtr;
+	char	   *lsn_text;
+
+	SPI_connect();
+	ret = SPI_execute_with_args(
+		"SELECT confirmed_flush_lsn::text "
+		"FROM pg_replication_slots "
+		"WHERE slot_name = $1",
+		1,
+		(Oid[]){TEXTOID},
+		(Datum[]){CStringGetTextDatum(slot_name)},
+		NULL, true, 1);
+
+	if (ret == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		lsn_text = SPI_getvalue(SPI_tuptable->vals[0],
+								SPI_tuptable->tupdesc, 1);
+		if (lsn_text != NULL)
+			(void) parse_lsn_text(lsn_text, &lsn);
+	}
+
+	SPI_finish();
+	return lsn;
+}
+
+static XLogRecPtr
 advance_logical_slot_to_lsn(const char *slot_name, XLogRecPtr upto_lsn)
 {
 	int			ret;
@@ -754,13 +737,27 @@ backup_full_finish_deferred_advance(Oid db_oid, const char *db_name,
 		XLogRecPtrIsInvalid(advance->stop_lsn))
 		return;
 
-	advance->stop_lsn = advance_logical_slot_to_lsn(advance->slot_name,
-													advance->stop_lsn);
+	/*
+	 * Order: upsert chain row, then advance slot, then mark slot retained.
+	 * Both operations run inside the caller's transaction so the chain row
+	 * insert is rolled back if any later step raises. pg_replication_slot_advance
+	 * however persists slot state outside MVCC, so if it succeeds and a later
+	 * step fails we'd be left with a moved slot but no chain row. To keep that
+	 * state recoverable, drop_slot_on_abort stays true until the advance has
+	 * succeeded: the PG_CATCH in the caller then drops the abandoned slot and
+	 * the next FULL backup starts a fresh chain.
+	 */
 	upsert_logical_chain(db_oid, db_name, advance->slot_name,
 						 advance->stop_lsn);
+	advance->stop_lsn = advance_logical_slot_to_lsn(advance->slot_name,
+													advance->stop_lsn);
+	advance->drop_slot_on_abort = false;
 	if (advance->reset_journal)
 		pgdb_logical_journal_reset_state();
-	advance->drop_slot_on_abort = false;
+	ereport(LOG,
+			(errmsg("pg_dbbackup: chain advanced for db \"%s\" slot \"%s\" to %X/%X (deferred)",
+					db_name, advance->slot_name,
+					LSN_FORMAT_ARGS(advance->stop_lsn))));
 }
 
 void
@@ -931,9 +928,21 @@ backup_full_full_common(Oid db_oid, const char *db_name, const char *filepath,
 			}
 			else
 			{
-				chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
+				/*
+				 * Order matters: write the chain row before advancing the
+				 * slot. A crash after the upsert but before the advance
+				 * leaves slot.confirmed < chain.endpoint; the next backup
+				 * reconciles it via active_chain_slot_for_previous_backup.
+				 * The reverse order would silently drop the chain row on
+				 * crash and force the user to take a new FULL backup.
+				 */
 				upsert_logical_chain(db_oid, db_name, logical_slot, chain_lsn);
+				chain_lsn = advance_logical_slot_to_lsn(logical_slot, chain_lsn);
 				pgdb_logical_journal_reset_state();
+				ereport(LOG,
+						(errmsg("pg_dbbackup: chain established for db \"%s\" slot \"%s\" at %X/%X (full)",
+								db_name, logical_slot,
+								LSN_FORMAT_ARGS(chain_lsn))));
 			}
 		}
 		PG_CATCH();
@@ -1133,8 +1142,13 @@ backup_full_differential_common(Oid db_oid, const char *db_name,
 		}
 		else
 		{
-			current_lsn = advance_logical_slot_to_lsn(slot_name, current_lsn);
+			/* See backup_full_finish_deferred_advance for ordering. */
 			upsert_logical_chain(db_oid, db_name, slot_name, current_lsn);
+			current_lsn = advance_logical_slot_to_lsn(slot_name, current_lsn);
+			ereport(LOG,
+					(errmsg("pg_dbbackup: chain advanced for db \"%s\" slot \"%s\" to %X/%X (differential)",
+							db_name, slot_name,
+							LSN_FORMAT_ARGS(current_lsn))));
 		}
 	}
 	PG_CATCH();
@@ -1328,8 +1342,13 @@ backup_full_log_common(Oid db_oid, const char *db_name, const char *filepath,
 		}
 		else
 		{
-			current_lsn = advance_logical_slot_to_lsn(logical_slot, current_lsn);
+			/* See backup_full_finish_deferred_advance for ordering. */
 			upsert_logical_chain(db_oid, db_name, logical_slot, current_lsn);
+			current_lsn = advance_logical_slot_to_lsn(logical_slot, current_lsn);
+			ereport(LOG,
+					(errmsg("pg_dbbackup: chain advanced for db \"%s\" slot \"%s\" to %X/%X (log)",
+							db_name, logical_slot,
+							LSN_FORMAT_ARGS(current_lsn))));
 		}
 	}
 	PG_CATCH();

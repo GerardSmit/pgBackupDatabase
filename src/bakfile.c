@@ -25,7 +25,7 @@ bakfile_write_raw(BakFileWriter *writer, const void *data, size_t len)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write to backup file \"%s\": %m",
-						writer->filepath)));
+						writer->temp_filepath)));
 }
 
 static void
@@ -350,6 +350,7 @@ bakfile_create(const char *filepath, BakFileHeader *header,
 
 	writer = palloc0(sizeof(BakFileWriter));
 	writer->filepath = pstrdup(filepath);
+	writer->temp_filepath = psprintf("%s.tmp", filepath);
 	writer->compress = compress;
 	writer->password = password ? pstrdup(password) : NULL;
 	memcpy(&writer->header, header, sizeof(BakFileHeader));
@@ -364,12 +365,12 @@ bakfile_create(const char *filepath, BakFileHeader *header,
 		strlcpy(writer->header.encryption_algo, "aes-256-gcm",
 				sizeof(writer->header.encryption_algo));
 
-	writer->fp = AllocateFile(filepath, "wb+");
+	writer->fp = AllocateFile(writer->temp_filepath, "wb+");
 	if (writer->fp == NULL)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not create backup file \"%s\": %m",
-						filepath)));
+						writer->temp_filepath)));
 
 	if (password != NULL)
 	{
@@ -629,28 +630,47 @@ bakfile_compute_file_sha256(BakFileWriter *writer, uint8 *digest_out)
 
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (ctx == NULL || pg_cryptohash_init(ctx) < 0)
+	{
+		if (ctx)
+			pg_cryptohash_free(ctx);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("could not init file SHA-256 context")));
-
-	while ((n = fread(buf, 1, sizeof(buf), writer->fp)) > 0)
-	{
-		if (pg_cryptohash_update(ctx, buf, n) < 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not update file SHA-256 context")));
 	}
 
-	if (ferror(writer->fp))
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read back backup file \"%s\": %m",
-						writer->filepath)));
+	/*
+	 * pg_cryptohash_create allocates a palloc'd struct that holds an
+	 * OpenSSL EVP_MD_CTX. MemoryContext reset on xact abort frees the
+	 * outer struct but not the OpenSSL handle; release explicitly along
+	 * every error path before re-throwing.
+	 */
+	PG_TRY();
+	{
+		while ((n = fread(buf, 1, sizeof(buf), writer->fp)) > 0)
+		{
+			if (pg_cryptohash_update(ctx, buf, n) < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("could not update file SHA-256 context")));
+		}
 
-	if (pg_cryptohash_final(ctx, digest_out, 32) < 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("could not finalize file SHA-256 context")));
+		if (ferror(writer->fp))
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read back backup file \"%s\": %m",
+							writer->filepath)));
+
+		if (pg_cryptohash_final(ctx, digest_out, 32) < 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not finalize file SHA-256 context")));
+	}
+	PG_CATCH();
+	{
+		pg_cryptohash_free(ctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	pg_cryptohash_free(ctx);
 
@@ -671,8 +691,21 @@ bakfile_close(BakFileWriter *writer)
 	bakfile_write_raw(writer, file_digest, sizeof(file_digest));
 	bakfile_write_raw(writer, BAKFILE_MAGIC, BAKFILE_MAGIC_LEN);
 
+	if (fflush(writer->fp) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not flush backup file \"%s\": %m",
+						writer->temp_filepath)));
+	if (pg_fsync(fileno(writer->fp)) != 0)
+		ereport(data_sync_elevel(ERROR),
+				(errcode_for_file_access(),
+				 errmsg("could not fsync backup file \"%s\": %m",
+						writer->temp_filepath)));
+
 	FreeFile(writer->fp);
 	writer->fp = NULL;
+
+	durable_rename(writer->temp_filepath, writer->filepath, ERROR);
 }
 
 void

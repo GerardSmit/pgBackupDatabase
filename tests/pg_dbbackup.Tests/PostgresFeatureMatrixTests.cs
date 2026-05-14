@@ -257,7 +257,7 @@ public sealed class PostgresFeatureMatrixTests
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Foreign_Tables()
+    public async Task FullBackup_Accepts_Foreign_Tables()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -267,35 +267,108 @@ public sealed class PostgresFeatureMatrixTests
             "CREATE FOREIGN TABLE imported_rows(id int) SERVER pgdb_file " +
             "OPTIONS (filename '/tmp/pgdbbackup_missing.csv', format 'csv');");
 
-        await AssertFullBackupRejectedAsync(src, "foreign_matrix", "foreign tables");
+        await src.BackupFullAsync(Helpers.BackupPath("foreign_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Regular_Materialized_Views()
+    public async Task FullBackup_Accepts_And_Restores_Materialized_Views()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
         await src.ExecAsync(
-            "CREATE TABLE mv_source(id int PRIMARY KEY);" +
-            "CREATE MATERIALIZED VIEW mv_source_snapshot AS SELECT * FROM mv_source;");
+            "CREATE TABLE mv_source(id int PRIMARY KEY, label text NOT NULL);" +
+            "INSERT INTO mv_source VALUES (1, 'one'), (2, 'two');" +
+            "CREATE MATERIALIZED VIEW mv_source_snapshot AS " +
+            "SELECT id, upper(label) AS upper_label FROM mv_source;");
 
-        await AssertFullBackupRejectedAsync(src, "matview_matrix", "materialized views");
+        var full = Helpers.BackupPath("matview_matrix");
+        await src.BackupFullAsync(full);
+        await src.CloseAsync();
+
+        var target = "matview_matrix_" + Guid.NewGuid().ToString("N")[..8];
+        try
+        {
+            await RestoreAsync(target, full);
+            await using var conn = await _pg.ConnectToAsync(target);
+
+            // Restored as WITH NO DATA; operator runs REFRESH to populate.
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT count(*) FROM pg_class "
+                    + "WHERE relname = 'mv_source_snapshot' AND relkind = 'm'";
+                Assert.Equal(1L, (long)(
+                    await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
+            }
+
+            await conn.ExecAsync("REFRESH MATERIALIZED VIEW mv_source_snapshot");
+
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT id, upper_label FROM mv_source_snapshot ORDER BY id";
+                await using var rdr = await cmd.ExecuteReaderAsync(
+                    TestContext.Current.CancellationToken);
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
+                Assert.Equal(1, rdr.GetInt32(0));
+                Assert.Equal("ONE", rdr.GetString(1));
+                Assert.True(await rdr.ReadAsync(TestContext.Current.CancellationToken));
+                Assert.Equal(2, rdr.GetInt32(0));
+                Assert.Equal("TWO", rdr.GetString(1));
+            }
+        }
+        finally
+        {
+            try { await _pg.DropDbAsync(target); } catch { }
+        }
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Ordinary_Table_Inheritance()
+    public async Task FullBackup_Accepts_And_Restores_Ordinary_Table_Inheritance()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
         await src.ExecAsync(
-            "CREATE TABLE inherited_parent(id int PRIMARY KEY);" +
-            "CREATE TABLE inherited_child(extra text) INHERITS (inherited_parent);");
+            "CREATE TABLE inherited_parent(id int PRIMARY KEY, kind text);" +
+            "CREATE TABLE inherited_child(extra text) INHERITS (inherited_parent);" +
+            "INSERT INTO inherited_parent(id, kind) VALUES (1, 'parent-row');" +
+            "INSERT INTO inherited_child(id, kind, extra) " +
+            "VALUES (2, 'child-row', 'detail');");
 
-        await AssertFullBackupRejectedAsync(src, "inheritance_matrix", "ordinary table inheritance");
+        var full = Helpers.BackupPath("inheritance_matrix");
+        await src.BackupFullAsync(full);
+        await src.CloseAsync();
+
+        var target = "inheritance_matrix_" + Guid.NewGuid().ToString("N")[..8];
+        try
+        {
+            await RestoreAsync(target, full);
+            await using var conn = await _pg.ConnectToAsync(target);
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT count(*) FROM pg_inherits "
+                    + "WHERE inhparent = 'inherited_parent'::regclass "
+                    + "  AND inhrelid = 'inherited_child'::regclass";
+                Assert.Equal(1L, (long)(
+                    await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
+            }
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText =
+                    "SELECT count(*) FROM inherited_parent";
+                Assert.Equal(2L, (long)(
+                    await cmd.ExecuteScalarAsync(TestContext.Current.CancellationToken))!);
+            }
+        }
+        finally
+        {
+            try { await _pg.DropDbAsync(target); } catch { }
+        }
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_User_Event_Triggers()
+    public async Task FullBackup_Accepts_User_Event_Triggers()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -305,22 +378,34 @@ public sealed class PostgresFeatureMatrixTests
             "CREATE EVENT TRIGGER user_event_trigger " +
             "ON ddl_command_end EXECUTE FUNCTION user_event_trigger_fn();");
 
-        await AssertFullBackupRejectedAsync(src, "event_trigger_matrix", "event triggers");
+        await src.BackupFullAsync(Helpers.BackupPath("event_trigger_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Custom_Range_Types()
+    public async Task FullBackup_Accepts_Custom_Range_Types()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
         await src.ExecAsync(
             "CREATE TYPE custom_float_range AS RANGE (subtype = float8);");
 
-        await AssertFullBackupRejectedAsync(src, "range_type_matrix", "range/base/pseudo types");
+        await src.BackupFullAsync(Helpers.BackupPath("range_type_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Custom_Text_Search_Configurations()
+    public async Task FullBackup_Rejects_Base_Types()
+    {
+        await using var src = await _pg.CreateFreshDbWithExtensionAsync();
+        await src.SetModeFullAsync();
+        // Shell type is a placeholder base type; the matrix should still
+        // refuse to back it up.
+        await src.ExecAsync("CREATE TYPE shell_type;");
+
+        await AssertFullBackupRejectedAsync(src, "base_type_matrix", "base/pseudo types");
+    }
+
+    [Fact]
+    public async Task FullBackup_Accepts_Custom_Text_Search_Configurations()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -328,12 +413,11 @@ public sealed class PostgresFeatureMatrixTests
             "CREATE TEXT SEARCH CONFIGURATION public.custom_simple_cfg " +
             "(COPY = pg_catalog.simple);");
 
-        await AssertFullBackupRejectedAsync(
-            src, "textsearch_matrix", "text search configurations");
+        await src.BackupFullAsync(Helpers.BackupPath("textsearch_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_User_Aggregates()
+    public async Task FullBackup_Accepts_User_Aggregates()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -347,11 +431,11 @@ public sealed class PostgresFeatureMatrixTests
             "  INITCOND = '0'" +
             ");");
 
-        await AssertFullBackupRejectedAsync(src, "aggregate_matrix", "aggregates");
+        await src.BackupFullAsync(Helpers.BackupPath("aggregate_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Logical_Publications()
+    public async Task FullBackup_Accepts_Logical_Publications()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -359,11 +443,11 @@ public sealed class PostgresFeatureMatrixTests
             "CREATE TABLE published_items(id int PRIMARY KEY);" +
             "CREATE PUBLICATION published_items_pub FOR TABLE published_items;");
 
-        await AssertFullBackupRejectedAsync(src, "publication_matrix", "publications");
+        await src.BackupFullAsync(Helpers.BackupPath("publication_matrix"));
     }
 
     [Fact]
-    public async Task FullBackup_Rejects_Logical_Subscriptions()
+    public async Task FullBackup_Accepts_Logical_Subscriptions()
     {
         await using var src = await _pg.CreateFreshDbWithExtensionAsync();
         await src.SetModeFullAsync();
@@ -373,7 +457,7 @@ public sealed class PostgresFeatureMatrixTests
             "PUBLICATION missing_pub " +
             "WITH (connect = false, enabled = false);");
 
-        await AssertFullBackupRejectedAsync(src, "subscription_matrix", "subscriptions");
+        await src.BackupFullAsync(Helpers.BackupPath("subscription_matrix"));
     }
 
     private static async Task AssertFullBackupRejectedAsync(
@@ -391,7 +475,7 @@ public sealed class PostgresFeatureMatrixTests
         await using var admin = await _pg.AdminAsync();
         await using var cmd = admin.CreateCommand();
         cmd.CommandText =
-            "SELECT dbbackup.pg_dbrestore(@db, @files::text[], target_db := @target)";
+            "SELECT dbbackup.pg_dbrestore(@files::text[], target_db := @target)";
         cmd.Parameters.AddWithValue("db", "ignored");
         cmd.Parameters.AddWithValue("files", files);
         cmd.Parameters.AddWithValue("target", target);

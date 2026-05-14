@@ -81,22 +81,6 @@ typedef struct ImportedManifest
 	bool		encrypted;
 } ImportedManifest;
 
-static PgDbBackupType
-parse_backup_type_arg(const char *type_str)
-{
-	if (strcmp(type_str, "full") == 0)
-		return BACKUP_TYPE_FULL;
-	if (strcmp(type_str, "differential") == 0)
-		return BACKUP_TYPE_DIFFERENTIAL;
-	if (strcmp(type_str, "log") == 0)
-		return BACKUP_TYPE_LOG;
-
-	ereport(ERROR,
-			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("type must be 'full', 'differential', or 'log'")));
-	return BACKUP_TYPE_FULL;
-}
-
 static const char *
 backup_type_name(PgDbBackupType type)
 {
@@ -235,13 +219,18 @@ load_s3_target(const char *target_name)
 		target->s3.force_path_style = !isnull && DatumGetBool(d);
 
 		d = SPI_getbinval(tuple, tupdesc, 11, &isnull);
-		target->s3.max_retries = isnull ? 3 : DatumGetInt32(d);
+		target->s3.max_retries = isnull
+			? pgdb_s3_default_max_retries : DatumGetInt32(d);
 		d = SPI_getbinval(tuple, tupdesc, 12, &isnull);
-		target->s3.connect_timeout_ms = isnull ? 10000 : DatumGetInt32(d);
+		target->s3.connect_timeout_ms = isnull
+			? pgdb_s3_default_connect_timeout_ms : DatumGetInt32(d);
 		d = SPI_getbinval(tuple, tupdesc, 13, &isnull);
-		target->s3.request_timeout_ms = isnull ? 300000 : DatumGetInt32(d);
+		target->s3.request_timeout_ms = isnull
+			? pgdb_s3_default_request_timeout_ms : DatumGetInt32(d);
 		d = SPI_getbinval(tuple, tupdesc, 14, &isnull);
-		target->s3.bandwidth_limit_bps = isnull ? 0 : DatumGetInt64(d);
+		target->s3.bandwidth_limit_bps = isnull
+			? (long) pgdb_s3_default_bandwidth_limit_kbps * 1024L
+			: DatumGetInt64(d);
 
 		if (target->s3.prefix == NULL)
 			target->s3.prefix = pstrdup("");
@@ -1244,7 +1233,7 @@ pg_dbbackup_to_storage(PG_FUNCTION_ARGS)
 		text_to_cstring(PG_GETARG_TEXT_PP(5));
 	char	   *base_id = PG_ARGISNULL(6) ? NULL :
 		uuid_to_cstring(PG_GETARG_UUID_P(6));
-	PgDbBackupType backup_type = parse_backup_type_arg(type_arg);
+	PgDbBackupType backup_type = pgdb_parse_backup_type(type_arg);
 	char	   *target_name;
 	StorageTarget *target;
 	pg_uuid_t	backup_id;
@@ -1276,6 +1265,13 @@ pg_dbbackup_to_storage(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to perform storage backups")));
+
+	{
+		Datum		routed_result;
+
+		if (pgdb_route_to_primary_if_standby(fcinfo, false, &routed_result))
+			PG_RETURN_DATUM(routed_result);
+	}
 
 	target_name = resolve_target_name(storage_target_arg, backup_set);
 	target = load_s3_target(target_name);
