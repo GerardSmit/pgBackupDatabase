@@ -19,6 +19,46 @@ optional AES-256-GCM encryption.
 🚀 **Status**: v0.0.1. `SIMPLE` is feature-complete. `FULL` covers per-database
 logical PITR. See the [Feature Matrix](#feature-matrix) below.
 
+## Contents
+
+- [How it Compares](#how-it-compares)
+- [PostgreSQL Version Compatibility](#postgresql-version-compatibility)
+- [Installation](#installation)
+- [Cluster Configuration](#cluster-configuration)
+- [Environment Variables](#environment-variables)
+- [Getting Started](#getting-started)
+- [Local File Backups](#local-file-backups)
+- [S3 / Storage-Target Backups](#s3--storage-target-backups)
+- [Scheduled Backups](#scheduled-backups)
+- [Async Backups](#async-backups)
+- [Listing Backups](#listing-backups)
+- [Retention](#retention)
+- [Restore Drills](#restore-drills)
+- [Inspecting Backups](#inspecting-backups)
+- [Feature Matrix](#feature-matrix)
+- [High Availability](#high-availability)
+- [Monitoring](#monitoring)
+- [Disaster Recovery Runbook](#disaster-recovery-runbook)
+- [Limitations](#limitations)
+- [Tests](#tests)
+- [License](#license)
+- [Contributing](#contributing)
+
+## How it Compares
+
+| Tool          | Scope            | Per-database backup | PITR        | Logical replay | Cross-PG-version restore |
+|---------------|------------------|---------------------|-------------|----------------|--------------------------|
+| `pg_dump`     | Single DB        | Yes                 | No          | N/A            | Yes                      |
+| `pgBackRest`  | Whole cluster    | No                  | Yes (WAL)   | No (physical)  | No                       |
+| `Barman`      | Whole cluster    | No                  | Yes (WAL)   | No (physical)  | No                       |
+| `pg_dbbackup` | Single DB        | Yes                 | Yes (FULL)  | Yes            | Yes (SIMPLE; same major for FULL) |
+
+`pg_dbbackup` targets the case where one PostgreSQL cluster hosts many
+independent databases and each needs its own backup chain, retention, and
+restore lifecycle — like SQL Server's `BACKUP DATABASE` / `BACKUP LOG`. Cluster
+recovery is out of scope; use pgBackRest or Barman alongside if you also need
+cluster-level PITR.
+
 ## PostgreSQL Version Compatibility
 
 `pg_dbbackup` supports PostgreSQL **17 and 18**. CI tests both on Ubuntu.
@@ -220,16 +260,47 @@ SELECT dbbackup.add_database_to_backup_set('nightly', 'app');
 ### 3. Run a backup
 
 ```sql
+-- Capture backup_id for chaining / status / retention lookups
 SELECT dbbackup.pg_dbbackup_to_storage(
     'app',
     type       := 'full',
     backup_set := 'nightly',
     compress   := true,
-    password   := 's3cret');
+    password   := 's3cret') AS backup_id \gset
 ```
 
 The function returns a `uuid` (the `backup_id`). Subsequent `differential` /
-`log` backups against the same set chain automatically.
+`log` backups against the same set chain automatically; pass
+`base_backup_id := :'backup_id'` to anchor against a specific FULL when
+chaining manually:
+
+```sql
+SELECT dbbackup.pg_dbbackup_to_storage(
+    'app',
+    type           := 'log',
+    backup_set     := 'nightly',
+    base_backup_id := :'backup_id',
+    compress       := true,
+    password       := 's3cret');
+```
+
+### Managing the database list
+
+```sql
+-- Replace the membership atomically
+SELECT dbbackup.set_backup_set_databases('nightly', ARRAY['app','orders']);
+
+-- List current members
+SELECT * FROM dbbackup.list_backup_set_databases('nightly');
+
+-- Drop a DB from the set; close_chain := true takes a final LOG before
+-- deactivating, keep_history := true leaves the row for audit.
+SELECT dbbackup.remove_database_from_backup_set(
+    backup_set   := 'nightly',
+    dbname       := 'app',
+    close_chain  := true,
+    keep_history := true);
+```
 
 ### 4. Restore from storage
 
@@ -254,6 +325,151 @@ When called on a hot standby, `pg_dbbackup_to_storage` automatically reconnects
 to the current primary using the standby's `primary_conninfo` and re-issues the
 call there. This makes it safe to route the call through PgDog or another SQL
 proxy.
+
+## Scheduled Backups
+
+A background-worker scheduler ticks once per minute and runs schedules that
+are due. Schedules are scoped to a backup set and use either a cron string or
+an `every` interval.
+
+```sql
+-- Nightly FULL at 02:30 UTC
+SELECT dbbackup.create_schedule(
+    backup_set  := 'nightly',
+    name        := 'nightly_full',
+    backup_type := 'full',
+    cron        := '30 2 * * *',
+    timezone    := 'UTC');
+
+-- LOG every 5 minutes during a maintenance window
+SELECT dbbackup.create_schedule(
+    backup_set   := 'nightly',
+    name         := 'log_5m',
+    backup_type  := 'log',
+    every        := interval '5 minutes',
+    window_start := time '00:00',
+    window_end   := time '06:00');
+
+-- Modify in place (NULL keeps the existing value)
+SELECT dbbackup.alter_schedule(
+    backup_set := 'nightly',
+    name       := 'nightly_full',
+    cron       := '0 3 * * *');
+
+SELECT dbbackup.pause_schedule ('nightly', 'log_5m');
+SELECT dbbackup.resume_schedule('nightly', 'log_5m');
+SELECT dbbackup.drop_schedule  ('nightly', 'log_5m');
+```
+
+Operators can also force a tick from SQL (useful in tests):
+
+```sql
+SELECT dbbackup.pg_dbbackup_run_due_schedules();
+```
+
+## Async Backups
+
+Long-running backups can be queued to the scheduler worker so the calling
+session does not block. Each async call returns a `backup_id` you poll with
+`pg_dbbackup_status()` or block on with `pg_dbbackup_wait()`.
+
+```sql
+-- Local file, async
+SELECT dbbackup.pg_dbbackup_async(
+    'app',
+    '/var/backups/app-async.bak',
+    type     := 'full',
+    compress := true) AS backup_id \gset
+
+-- Storage target, async
+SELECT dbbackup.pg_dbbackup_to_storage_async(
+    'app',
+    type       := 'full',
+    backup_set := 'nightly') AS backup_id \gset
+
+-- Non-blocking status check
+SELECT status, progress_pct, error_message, started_at, completed_at
+  FROM dbbackup.pg_dbbackup_status(:'backup_id');
+
+-- Block until terminal (or timeout)
+SELECT dbbackup.pg_dbbackup_wait(:'backup_id', timeout_secs := 600);
+```
+
+`pg_dbbackup_wait` returns the `status` text observed when it returned:
+`completed` / `failed` if a terminal state was reached, or `pending` /
+`running` if the timeout elapsed first.
+
+## Listing Backups
+
+Two flavors:
+
+```sql
+-- Flat artifact listing for a database within a storage target
+SELECT *
+  FROM dbbackup.pg_dbbackup_search(
+    dbname         := 'app',
+    storage_target := 'prod_s3',
+    from_time      := now() - interval '7 days');
+```
+
+```sql
+-- Chain-aware view: groups FULL/DIFF/LOG and flags restorable chains
+SELECT chain_id, range_start, range_end, full_uri,
+       diff_count, log_count, restorable, gap_reason
+  FROM dbbackup.search_backups(
+    dbname         := 'app',
+    storage_target := 'prod_s3');
+```
+
+`search_backups` calls `pg_dbbackup_s3_object_exists` on every artifact and
+sets `restorable = false` with a `gap_reason` when remote objects are missing.
+Both functions refresh the local catalog from S3 if no rows are cached yet.
+
+## Retention
+
+Retention is configured per backup set and applied by either the scheduler
+tick or an explicit call. `pg_dbbackup_retention_plan` previews what will be
+deleted; `pg_dbbackup_apply_retention` performs the delete (defaults to a dry
+run).
+
+```sql
+SELECT dbbackup.set_retention_policy(
+    backup_set            := 'nightly',
+    keep_logs_for         := interval '14 days',
+    keep_fulls_for        := interval '31 days',
+    keep_min_full_chains  := 2,
+    delete_from_storage   := true);
+
+-- Preview
+SELECT backup_id, dbname, backup_type, reason, delete_remote
+  FROM dbbackup.pg_dbbackup_retention_plan('nightly');
+
+-- Apply
+SELECT dbbackup.pg_dbbackup_apply_retention('nightly', dry_run := false);
+```
+
+`keep_min_full_chains` is a floor: the N newest FULL chains per database are
+never expired regardless of `keep_fulls_for`.
+
+## Restore Drills
+
+Verify your chains are actually restorable. `restore_drill` runs a real PITR
+into a sandbox database and logs a `restore_drill_completed` event on success.
+`restore_drill_plan` suggests a small sample of (database, stop_at) pairs
+from a backup set.
+
+```sql
+SELECT * FROM dbbackup.restore_drill_plan('nightly', sample_size := 3);
+
+SELECT dbbackup.restore_drill(
+    dbname         := 'app',
+    storage_target := 'prod_s3',
+    stop_at        := now() - interval '10 minutes',
+    target_db      := 'app_drill',
+    password       := 's3cret');
+```
+
+Schedule the call from cron and watch `dbbackup.backup_events` for failures.
 
 ## Inspecting Backups
 
@@ -299,13 +515,75 @@ SELECT dbbackup.pg_dbbackup_failover_slot_ready('app');
 -- must return true; a synced-but-temporary slot does not survive promotion
 ```
 
+Full slot diagnostics:
+
+```sql
+SELECT slot_name, slot_exists, failover, synced, temporary,
+       invalidation_reason, restart_lsn, confirmed_flush_lsn,
+       wal_status, standby_ready
+  FROM dbbackup.pg_dbbackup_failover_slot_status('app');
+```
+
+`standby_ready = true` requires `slot_type = 'logical'`,
+`plugin = 'pg_dbbackup'`, `failover = true`, `synced = true`,
+`temporary = false`, and `invalidation_reason IS NULL`.
+
+Block until the standby's synced slot is ready (e.g. inside a promotion
+script):
+
+```sql
+SELECT dbbackup.pg_dbbackup_wait_failover_slot_ready('app', timeout_secs := 120);
+```
+
 If the slot is missing, temporary, invalidated, or non-failover after
 promotion, LOG/DIFFERENTIAL backup refuses to continue and the next backup
-must be a fresh FULL.
+must be a fresh FULL. The reseed helper does this for every database in a
+backup set and respects the set's `on_unsafe_failover` policy:
+
+```sql
+-- Returns the number of databases re-seeded (or planned to)
+SELECT dbbackup.pg_dbbackup_reseed_if_needed('nightly');
+```
 
 `pg_dbbackup_to_storage` calls issued on a hot standby auto-route to the
 current primary via `primary_conninfo`. `pg_dbbackup` (local-file output) is
 rejected on standbys — use the storage form instead.
+
+## Monitoring
+
+Operational state lives in the `dbbackup` schema and is safe to read from
+dashboards / Grafana / Prometheus exporters.
+
+| Object | What you get |
+|---|---|
+| `dbbackup.backup_jobs` | One row per async invocation: `status`, `progress`, `error_msg`, timings. Use `pg_dbbackup_status(uuid)` for a typed view. |
+| `dbbackup.backup_artifacts` | Catalog of every produced `.bak` (local + storage). `range_start_time`, `range_end_time`, `chain_id`, `status`, `size_bytes`, `object_uri`. |
+| `dbbackup.backup_events` | Severity-tagged log: `retention_deleted`, `restore_drill_completed`, `close_chain_failed`, `database_missing`, etc. Tail it for alerting. |
+| `dbbackup.logical_chains` | One row per FULL-mode database: `slot_name`, `confirmed_lsn`, `updated_at`. Compare against `pg_replication_slots`. |
+| `dbbackup.backup_schedules` | Configured schedules with `enabled`, `last_run_at`, `run_count`. |
+| `search_backups(dbname, storage_target)` | Chain-aware restorability view: `restorable`, `gap_reason`, `required_artifacts`. |
+
+Quick health probes:
+
+```sql
+-- Any failed async jobs in the last 24h?
+SELECT backup_id, error_msg, completed_at
+  FROM dbbackup.backup_jobs
+ WHERE status = 'failed'
+   AND completed_at > now() - interval '1 day';
+
+-- Any chain whose latest LOG is older than 15 minutes?
+SELECT db_name, confirmed_lsn, updated_at
+  FROM dbbackup.logical_chains
+ WHERE updated_at < now() - interval '15 minutes';
+
+-- Recent operational events (warnings + above)
+SELECT created_at, severity, event_type, dbname, message
+  FROM dbbackup.backup_events
+ WHERE severity IN ('warning','error')
+   AND created_at > now() - interval '1 day'
+ ORDER BY created_at DESC;
+```
 
 ## Disaster Recovery Runbook
 
