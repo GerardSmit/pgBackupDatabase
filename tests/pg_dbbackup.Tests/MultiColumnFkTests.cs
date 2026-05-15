@@ -80,7 +80,9 @@ public sealed class MultiColumnFkTests
                 var ex = await Assert.ThrowsAsync<PostgresException>(
                     () => c.ExecuteNonQueryAsync(
                         TestContext.Current.CancellationToken));
-                Assert.Equal("23503", ex.SqlState);
+                // PG 17 reports foreign_key_violation (23503); PG 18 reports
+                // the more specific restrict_violation (23001).
+                Assert.Contains(ex.SqlState, new[] { "23503", "23001" });
             }
 
             // ON UPDATE CASCADE propagates.

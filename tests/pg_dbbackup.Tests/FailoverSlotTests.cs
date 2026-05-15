@@ -193,6 +193,7 @@ public sealed class FailoverSlotTests
     {
         var command =
             "set -e; " +
+            "mkdir -p \"$PGDATA\"; " +
             "rm -rf \"$PGDATA\"/*; " +
             "chown -R postgres:postgres \"$PGDATA\"; " +
             "until pg_isready -h pg-primary -U postgres -d postgres; do sleep 1; done; " +
