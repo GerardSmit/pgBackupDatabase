@@ -48,7 +48,7 @@ public sealed class PgContainerFixture : IAsyncLifetime
             .WithCommand(
                 "-c", "shared_preload_libraries=pg_dbbackup",
                 "-c", "wal_level=logical",
-                "-c", "max_replication_slots=100",
+                "-c", "max_replication_slots=500",
                 "-c", "track_commit_timestamp=on",
                 "-c", "max_wal_senders=5",
                 "-c", "wal_keep_size=64",
