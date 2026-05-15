@@ -5,3 +5,9 @@ tests
 **/obj
 *.bak
 test_run*.log
+src/*.o
+src/*.so
+src/*.bc
+*.so
+*.bc
+stage
