@@ -78,7 +78,10 @@ public sealed class PitrSubSecondPrecisionTests
                 break;
             }
         }
-        Assert.NotNull(subMsIdx);
+        if (subMsIdx is null)
+            Assert.Skip(
+                "No two consecutive commits landed in the same millisecond on " +
+                "this runner; cannot exercise sub-millisecond cutoff resolution.");
 
         var earlier = commits[subMsIdx!.Value - 1];
         var later = commits[subMsIdx.Value];

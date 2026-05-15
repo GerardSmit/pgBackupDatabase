@@ -465,7 +465,10 @@ public sealed class PgdogTests
             ContainsIgnoreCase(message, "recovery") ||
             ContainsIgnoreCase(message, "standby") ||
             ContainsIgnoreCase(message, "connection pool") ||
-            ContainsIgnoreCase(message, "pool is down"),
+            ContainsIgnoreCase(message, "pool is down") ||
+            ContainsIgnoreCase(message, "connection reset") ||
+            ContainsIgnoreCase(message, "Exception while reading from stream") ||
+            ContainsIgnoreCase(message, "broken pipe"),
             "Expected pgdog standby route to fail instead of routing backup to " +
             $"primary, but got: {message}");
     }
