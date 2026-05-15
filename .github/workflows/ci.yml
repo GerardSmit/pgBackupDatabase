@@ -54,9 +54,13 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Build tests
+        working-directory: tests/pg_dbbackup.Tests
+        run: dotnet build -c Release --nologo
+
       - name: Run tests
         working-directory: tests/pg_dbbackup.Tests
-        run: dotnet test --logger "console;verbosity=normal"
+        run: ./bin/Release/net10.0/pg_dbbackup.Tests --no-progress
 
   release:
     needs: test
