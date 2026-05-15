@@ -38,7 +38,11 @@ public sealed class PitrSubSecondPrecisionTests
             "    COMMIT; " +
             "  END LOOP; " +
             "END $$;");
+        // Disable synchronous_commit so the COMMITs inside the
+        // procedure can land in the same millisecond on slow CI disks.
+        await src.ExecAsync("SET synchronous_commit = off;");
         await src.ExecAsync("CALL precise_fill();");
+        await src.ExecAsync("CHECKPOINT;");
 
         // Collect (xid, commit_ts) of each row. precise_t row id = xid is
         // not guaranteed but pg_xact_commit_timestamp(xmin) returns the

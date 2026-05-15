@@ -120,6 +120,9 @@ public sealed class FailoverSlotTests
 
             await DockerCpFromAsync(primary, fullPath, hostFullPath);
             await DockerCpToAsync(hostFullPath, standby, fullPath);
+            await ShellOrThrowAsync(standby,
+                $"chown postgres:postgres {fullPath} && chmod 644 {fullPath}",
+                "make copied backup readable by postgres");
 
             await primary.StopAsync(TestContext.Current.CancellationToken);
             await using (var standbyAdmin = await ConnectAsync(standby, PostgresDb))
